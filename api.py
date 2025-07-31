@@ -350,7 +350,7 @@ async def api_link(request: web.Request):
                     "message": "File size is zero."
                 }, status=404)
             
-            base_url = "http://localhost:8000"
+            base_url = "https://filetolink-production-f396.up.railway.app"
             return web.json_response({
                 "status": "success",
                 "message": "File To Link API Is Alive ✅",

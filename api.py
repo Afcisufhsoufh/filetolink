@@ -15,10 +15,10 @@ from config import LOG_CHANNEL_ID, API_ID, API_HASH, BOT_TOKEN
 from pyrogram.enums import ChatMemberStatus
 
 SECURE_HASH_LENGTH = 6
-CHUNK_SIZE = 1024 * 1024 * 4  # Increased to 4MB for faster streaming
-MAX_CONCURRENT_TASKS = 20  # Increased to handle more concurrent streams
+CHUNK_SIZE = 1024 * 1024 * 4
+MAX_CONCURRENT_TASKS = 20
 CACHE_TTL = 3600
-STREAM_TIMEOUT = 30  # Timeout for streaming in seconds
+STREAM_TIMEOUT = 30
 
 routes = web.RouteTableDef()
 work_loads = {0: 0}
@@ -182,21 +182,54 @@ class ByteStreamer:
             chunk_limit = (limit + CHUNK_SIZE - 1) // CHUNK_SIZE if limit > 0 else 0
             logger.debug(f"Streaming file {message_id} with offset {offset} and limit {limit}")
             start_time = dt.now()
+            
             try:
-                async for chunk in self.client.stream_media(message, offset=chunk_offset, limit=chunk_limit, timeout=STREAM_TIMEOUT):
+                # Create timeout task
+                timeout_task = asyncio.create_task(asyncio.sleep(STREAM_TIMEOUT))
+                stream_task = asyncio.create_task(self._stream_media_chunks(message, chunk_offset, chunk_limit))
+                
+                done, pending = await asyncio.wait([stream_task, timeout_task], return_when=asyncio.FIRST_COMPLETED)
+                
+                # Cancel pending tasks
+                for task in pending:
+                    task.cancel()
+                
+                if timeout_task in done:
+                    logger.error(f"Streaming timed out for message {message_id} after {STREAM_TIMEOUT}s")
+                    raise FileNotFound(f"Streaming timeout after {STREAM_TIMEOUT}s")
+                
+                # Get the result from stream_task
+                async for chunk in await stream_task:
                     duration = (dt.now() - start_time).total_seconds()
                     logger.debug(f"Streamed chunk for message {message_id}, duration: {duration:.2f}s")
                     yield chunk
+                    
                 logger.debug(f"Completed streaming file {message_id}")
-            except asyncio.TimeoutError:
-                logger.error(f"Streaming timed out for message {message_id} after {STREAM_TIMEOUT}s")
-                raise FileNotFound(f"Streaming timeout after {STREAM_TIMEOUT}s")
+                
             except FloodWait as e:
                 logger.debug(f"FloodWait: stream_file, sleep {e.value}s")
                 await asyncio.sleep(e.value)
+                # Retry streaming after flood wait
+                async for chunk in self.stream_file(message_id, offset, limit):
+                    yield chunk
             except Exception as e:
                 logger.error(f"Error streaming file {message_id}: {e}", exc_info=True)
                 raise FileNotFound(f"Streaming error: {str(e)}")
+
+    async def _stream_media_chunks(self, message: Message, chunk_offset: int, chunk_limit: int):
+        """Helper method to stream media chunks without timeout parameter"""
+        chunks = []
+        try:
+            if chunk_limit > 0:
+                async for chunk in self.client.stream_media(message, offset=chunk_offset, limit=chunk_limit):
+                    chunks.append(chunk)
+            else:
+                async for chunk in self.client.stream_media(message, offset=chunk_offset):
+                    chunks.append(chunk)
+        except Exception as e:
+            logger.error(f"Error in _stream_media_chunks: {e}")
+            raise
+        return chunks
 
     async def get_file_info(self, message_id: int) -> Dict[str, Any]:
         cache_key = f"{message_id}"
@@ -231,7 +264,7 @@ def get_streamer(client_id: int) -> ByteStreamer:
 def parse_media_request(path: str, query: dict) -> tuple[int, str, str]:
     clean_path = path.strip('/')
     if clean_path.startswith('/'):
-        clean_path = clean_path[1:]  # Remove extra leading slashes
+        clean_path = clean_path[1:]
     match = PATTERN_HASH_FIRST.match(clean_path)
     if match:
         try:
@@ -320,6 +353,7 @@ async def media_delivery(request: web.Request):
             if range_header:
                 headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
             logger.debug(f"{'Streaming' if action == 'stream' else 'Downloading'} file {message_id} with range {start}-{end}")
+            
             async def stream_generator():
                 try:
                     bytes_sent = 0
@@ -341,6 +375,7 @@ async def media_delivery(request: web.Request):
                             break
                 finally:
                     work_loads[client_id] -= 1
+                    
             return web.Response(
                 status=206 if range_header else 200,
                 body=stream_generator(),
@@ -396,7 +431,7 @@ async def api_link(request: web.Request):
                 "file": {
                     "message_id": file_info.get("message_id"),
                     "file_name": file_info.get("file_name"),
-                    "file_size": file_info.get("file_size"),  # Return raw bytes for bot to handle conversion
+                    "file_size": file_info.get("file_size"),
                     "mime_type": file_info.get("mime_type"),
                     "media_type": file_info.get("media_type"),
                     "stream_link": f"{base_url}/stream/{secure_hash}{message_id}",

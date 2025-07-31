@@ -61,8 +61,25 @@ async def handle_flood_wait(func, *args, **kwargs):
             logger.debug(f"FloodWait: {func.__name__}, sleep {e.value}s")
             await asyncio.sleep(e.value)
 
+async def resolve_channel(client: Client, chat_id: int) -> bool:
+    try:
+        logger.debug(f"Resolving peer for channel {chat_id}")
+        await client.resolve_peer(chat_id)
+        logger.debug(f"Successfully resolved peer for channel {chat_id}")
+        return True
+    except PeerIdInvalid as e:
+        logger.error(f"PeerIdInvalid: Cannot resolve channel {chat_id}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error resolving channel {chat_id}: {e}", exc_info=True)
+        return False
+
 async def check_channel_access(client: Client, chat_id: int) -> bool:
     try:
+        if not await resolve_channel(client, chat_id):
+            logger.error(f"Failed to resolve channel {chat_id} before checking access")
+            return False
+        logger.debug(f"Checking API client's admin status in channel {chat_id}")
         member = await client.get_chat_member(chat_id, "me")
         if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
             logger.debug(f"API client is admin in channel {chat_id}")

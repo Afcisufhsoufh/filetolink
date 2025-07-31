@@ -6,16 +6,14 @@ from typing import Any, Dict, AsyncGenerator
 from urllib.parse import quote
 from cachetools import TTLCache
 from pyrogram import Client
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, PeerIdInvalid
 from pyrogram.types import Message
 from pyrogram.file_id import FileId
 import aiohttp
 from aiohttp import web
+from config import LOG_CHANNEL_ID, API_ID, API_HASH, BOT_TOKEN
+from pyrogram.enums import ChatMemberStatus
 
-API_ID = 28239710
-API_HASH = "7fc5b35692454973318b86481ab5eca3"
-BOT_TOKEN = "8431050298:AAEA4WTgley3RyFJYERh2cthN1Deb0otNGo"
-BIN_CHANNEL = -1002735511721
 SECURE_HASH_LENGTH = 6
 CHUNK_SIZE = 1024 * 1024
 MAX_CONCURRENT_TASKS = 10
@@ -62,6 +60,22 @@ async def handle_flood_wait(func, *args, **kwargs):
         except FloodWait as e:
             logger.debug(f"FloodWait: {func.__name__}, sleep {e.value}s")
             await asyncio.sleep(e.value)
+
+async def check_channel_access(client: Client, chat_id: int) -> bool:
+    try:
+        member = await client.get_chat_member(chat_id, "me")
+        if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+            logger.debug(f"API client is admin in channel {chat_id}")
+            return True
+        else:
+            logger.error(f"API client is not an admin in channel {chat_id}, status: {member.status}")
+            return False
+    except PeerIdInvalid as e:
+        logger.error(f"PeerIdInvalid: API client cannot access channel {chat_id}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error checking channel access for {chat_id}: {e}", exc_info=True)
+        return False
 
 def get_media(message: Message) -> Any:
     logger.debug(f"Checking media in message {message.id}")
@@ -127,12 +141,14 @@ async def get_fids(client: Client, chat_id: int, message_id: int) -> FileId:
 class ByteStreamer:
     def __init__(self, client: Client) -> None:
         self.client = client
-        self.chat_id = BIN_CHANNEL
+        self.chat_id = LOG_CHANNEL_ID
 
     async def get_message(self, message_id: int) -> Message:
         async with semaphore:
             try:
-                logger.debug(f"Fetching message {message_id} from BIN_CHANNEL")
+                if not await check_channel_access(self.client, self.chat_id):
+                    raise FileNotFound(f"API client lacks access to channel {self.chat_id}")
+                logger.debug(f"Fetching message {message_id} from LOG_CHANNEL")
                 message = await handle_flood_wait(self.client.get_messages, self.chat_id, message_id)
                 if not message or not message.media:
                     raise FileNotFound(f"Message {message_id} not found")
@@ -195,6 +211,7 @@ def parse_media_request(path: str, query: dict) -> tuple[int, str, str]:
             message_id = int(match.group(3))
             secure_hash = match.group(2)
             if len(secure_hash) == SECURE_HASH_LENGTH and VALID_HASH_REGEX.match(secure_hash):
+                logger.debug(f"Parsed request: action={action}, secure_hash={secure_hash}, message_id={message_id}")
                 return message_id, secure_hash, action
         except ValueError as e:
             raise InvalidHash(f"Invalid message ID format: {e}") from e
@@ -245,7 +262,6 @@ async def media_delivery(request: web.Request):
             raise InvalidHash("Action mismatch in URL")
         client_id, streamer = select_optimal_client()
         work_loads[client_id] += 1
-        
         try:
             file_info = await streamer.get_file_info(message_id)
             if not file_info.get('unique_id'):
@@ -255,14 +271,11 @@ async def media_delivery(request: web.Request):
             file_size = file_info.get('file_size', 0)
             if file_size == 0:
                 raise FileNotFound("File size is zero.")
-            
             range_header = request.headers.get("Range", "")
             start, end = parse_range_header(range_header, file_size)
             content_length = end - start + 1
-            
             mime_type = file_info.get('mime_type') or 'application/octet-stream'
             filename = file_info.get('file_name') or f"file_{secrets.token_hex(4)}"
-            
             headers = {
                 "Content-Type": mime_type,
                 "Content-Length": str(content_length),
@@ -271,10 +284,8 @@ async def media_delivery(request: web.Request):
                 "Cache-Control": "public, max-age=31536000",
                 "Connection": "keep-alive"
             }
-            
             if range_header:
                 headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-            
             logger.debug(f"{'Streaming' if action == 'stream' else 'Downloading'} file {message_id} with range {start}-{end}")
             async def stream_generator():
                 try:
@@ -297,13 +308,11 @@ async def media_delivery(request: web.Request):
                             break
                 finally:
                     work_loads[client_id] -= 1
-            
             return web.Response(
                 status=206 if range_header else 200,
                 body=stream_generator(),
                 headers=headers
             )
-        
         except (FileNotFound, InvalidHash):
             work_loads[client_id] -= 1
             raise
@@ -312,7 +321,6 @@ async def media_delivery(request: web.Request):
             error_id = secrets.token_hex(6)
             logger.error(f"Stream error {error_id}: {e}", exc_info=True)
             raise web.HTTPInternalServerError(text=f"Server error: {error_id}") from e
-    
     except (InvalidHash, FileNotFound) as e:
         logger.debug(f"Client error: {type(e).__name__} - {e}", exc_info=True)
         raise web.HTTPNotFound(text="Resource not found") from e
@@ -330,7 +338,6 @@ async def api_link(request: web.Request):
         if req_action != "api/link":
             raise InvalidHash("Action mismatch in URL")
         client_id, streamer = select_optimal_client()
-        
         try:
             file_info = await streamer.get_file_info(message_id)
             if not file_info.get('unique_id'):
@@ -349,7 +356,6 @@ async def api_link(request: web.Request):
                     "status": "error",
                     "message": "File size is zero."
                 }, status=404)
-            
             base_url = "https://filetolink-production-f396.up.railway.app"
             return web.json_response({
                 "status": "success",
@@ -357,14 +363,13 @@ async def api_link(request: web.Request):
                 "file": {
                     "message_id": file_info.get("message_id"),
                     "file_name": file_info.get("file_name"),
-                    "file_size": f"{file_size / (1024 * 1024):.2f} MB",
+                    "file_size": file_info.get("file_size"),  # Return raw bytes for bot to handle conversion
                     "mime_type": file_info.get("mime_type"),
                     "media_type": file_info.get("media_type"),
                     "stream_link": f"{base_url}/stream/{secure_hash}{message_id}",
                     "download_link": f"{base_url}/download/{secure_hash}{message_id}"
                 }
             })
-        
         except (FileNotFound, InvalidHash) as e:
             return web.json_response({
                 "status": "error",
@@ -377,7 +382,6 @@ async def api_link(request: web.Request):
                 "status": "error",
                 "message": f"Server error: {error_id}"
             }, status=500)
-    
     except (InvalidHash, FileNotFound) as e:
         logger.debug(f"Client error: {type(e).__name__} - {e}", exc_info=True)
         return web.json_response({
@@ -395,6 +399,10 @@ async def api_link(request: web.Request):
 async def main():
     await app.start()
     logger.info("API Pyrogram client started")
+    if not await check_channel_access(app, LOG_CHANNEL_ID):
+        logger.error("API client failed to start: No access to LOG_CHANNEL")
+        await app.stop()
+        return
     for _ in range(MAX_CONCURRENT_TASKS):
         asyncio.create_task(queue_worker())
     web_app = web.Application()

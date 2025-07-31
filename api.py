@@ -24,8 +24,6 @@ routes = web.RouteTableDef()
 work_loads = {0: 0}
 streamers = {}
 metadata_cache = TTLCache(maxsize=1000, ttl=CACHE_TTL)
-task_queue = asyncio.Queue()
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 RANGE_REGEX = re.compile(r"bytes=(?P<start>\d*)-(?P<end>\d*)")
 PATTERN_HASH_FIRST = re.compile(rf"^(stream|download|api/link)/([a-zA-Z0-9_-]{{{SECURE_HASH_LENGTH}}})(\d+)(?:/.*)?$")
@@ -35,6 +33,9 @@ class FileNotFound(Exception):
     pass
 
 class InvalidHash(Exception):
+    pass
+
+class StreamTimeout(Exception):
     pass
 
 class Logger:
@@ -72,7 +73,7 @@ async def resolve_channel(client: Client, chat_id: int) -> bool:
         logger.error(f"PeerIdInvalid: Cannot resolve channel {chat_id}: {e}")
         return False
     except Exception as e:
-        logger.error(f"Error resolving channel {chat_id}: {e}", exc_info=True)
+        logger.error(f"Error resolving channel {chat_id}: {e}")
         return False
 
 async def check_channel_access(client: Client, chat_id: int) -> bool:
@@ -92,7 +93,7 @@ async def check_channel_access(client: Client, chat_id: int) -> bool:
         logger.error(f"PeerIdInvalid: API client cannot access channel {chat_id}: {e}")
         return False
     except Exception as e:
-        logger.error(f"Error checking channel access for {chat_id}: {e}", exc_info=True)
+        logger.error(f"Error checking channel access for {chat_id}: {e}")
         return False
 
 def get_media(message: Message) -> Any:
@@ -141,120 +142,88 @@ def get_fname(msg: Message) -> str:
     logger.debug(f"Generated file name: {fname}")
     return fname
 
-async def get_fids(client: Client, chat_id: int, message_id: int) -> FileId:
-    async with semaphore:
-        try:
-            logger.debug(f"Fetching message {message_id} from chat {chat_id}")
-            msg = await handle_flood_wait(client.get_messages, chat_id, message_id)
-            if not msg or getattr(msg, 'empty', False):
-                raise FileNotFound("Message not found")
-            media = get_media(msg)
-            if media and hasattr(media, 'file_id') and hasattr(media, 'file_unique_id'):
-                return FileId.decode(media.file_id)
-            raise FileNotFound("No valid media in message")
-        except Exception as e:
-            logger.error(f"Error in get_fids: {e}", exc_info=True)
-            raise FileNotFound(str(e))
-
 class ByteStreamer:
     def __init__(self, client: Client) -> None:
         self.client = client
         self.chat_id = LOG_CHANNEL_ID
 
     async def get_message(self, message_id: int) -> Message:
-        async with semaphore:
-            try:
-                if not await check_channel_access(self.client, self.chat_id):
-                    raise FileNotFound(f"API client lacks access to channel {self.chat_id}")
-                logger.debug(f"Fetching message {message_id} from LOG_CHANNEL")
-                message = await handle_flood_wait(self.client.get_messages, self.chat_id, message_id)
-                if not message or not message.media:
-                    raise FileNotFound(f"Message {message_id} not found")
-                return message
-            except Exception as e:
-                logger.debug(f"Error fetching message {message_id}: {e}", exc_info=True)
-                raise FileNotFound(f"Message {message_id} not found") from e
+        try:
+            if not await check_channel_access(self.client, self.chat_id):
+                raise FileNotFound(f"API client lacks access to channel {self.chat_id}")
+            logger.debug(f"Fetching message {message_id} from LOG_CHANNEL")
+            message = await handle_flood_wait(self.client.get_messages, self.chat_id, message_id)
+            if not message or not message.media:
+                raise FileNotFound(f"Message {message_id} not found")
+            return message
+        except Exception as e:
+            logger.debug(f"Error fetching message {message_id}: {e}")
+            raise FileNotFound(f"Message {message_id} not found") from e
 
     async def stream_file(self, message_id: int, offset: int = 0, limit: int = 0) -> AsyncGenerator[bytes, None]:
-        async with semaphore:
-            message = await self.get_message(message_id)
-            chunk_offset = offset // CHUNK_SIZE
-            chunk_limit = (limit + CHUNK_SIZE - 1) // CHUNK_SIZE if limit > 0 else 0
-            logger.debug(f"Streaming file {message_id} with offset {offset} and limit {limit}")
-            start_time = dt.now()
-            
-            try:
-                # Create timeout task
-                timeout_task = asyncio.create_task(asyncio.sleep(STREAM_TIMEOUT))
-                stream_task = asyncio.create_task(self._stream_media_chunks(message, chunk_offset, chunk_limit))
-                
-                done, pending = await asyncio.wait([stream_task, timeout_task], return_when=asyncio.FIRST_COMPLETED)
-                
-                # Cancel pending tasks
-                for task in pending:
-                    task.cancel()
-                
-                if timeout_task in done:
-                    logger.error(f"Streaming timed out for message {message_id} after {STREAM_TIMEOUT}s")
-                    raise FileNotFound(f"Streaming timeout after {STREAM_TIMEOUT}s")
-                
-                # Get the result from stream_task
-                async for chunk in await stream_task:
-                    duration = (dt.now() - start_time).total_seconds()
-                    logger.debug(f"Streamed chunk for message {message_id}, duration: {duration:.2f}s")
-                    yield chunk
-                    
-                logger.debug(f"Completed streaming file {message_id}")
-                
-            except FloodWait as e:
-                logger.debug(f"FloodWait: stream_file, sleep {e.value}s")
-                await asyncio.sleep(e.value)
-                # Retry streaming after flood wait
-                async for chunk in self.stream_file(message_id, offset, limit):
-                    yield chunk
-            except Exception as e:
-                logger.error(f"Error streaming file {message_id}: {e}", exc_info=True)
-                raise FileNotFound(f"Streaming error: {str(e)}")
-
-    async def _stream_media_chunks(self, message: Message, chunk_offset: int, chunk_limit: int):
-        """Helper method to stream media chunks without timeout parameter"""
-        chunks = []
+        message = await self.get_message(message_id)
+        chunk_offset = offset // CHUNK_SIZE
+        chunk_limit = (limit + CHUNK_SIZE - 1) // CHUNK_SIZE if limit > 0 else 0
+        logger.debug(f"Streaming file {message_id} with offset {offset} and limit {limit}")
+        
+        start_time = dt.now()
+        
         try:
             if chunk_limit > 0:
-                async for chunk in self.client.stream_media(message, offset=chunk_offset, limit=chunk_limit):
-                    chunks.append(chunk)
+                stream_iter = self.client.stream_media(message, offset=chunk_offset, limit=chunk_limit)
             else:
-                async for chunk in self.client.stream_media(message, offset=chunk_offset):
-                    chunks.append(chunk)
+                stream_iter = self.client.stream_media(message, offset=chunk_offset)
+            
+            timeout_task = None
+            async for chunk in stream_iter:
+                current_time = dt.now()
+                duration = (current_time - start_time).total_seconds()
+                
+                if duration > STREAM_TIMEOUT:
+                    logger.error(f"Streaming timed out for message {message_id} after {STREAM_TIMEOUT}s")
+                    raise StreamTimeout(f"Streaming timeout after {STREAM_TIMEOUT}s")
+                
+                logger.debug(f"Streamed chunk for message {message_id}, duration: {duration:.2f}s")
+                yield chunk
+                
+            logger.debug(f"Completed streaming file {message_id}")
+            
+        except FloodWait as e:
+            logger.debug(f"FloodWait: stream_file, sleep {e.value}s")
+            await asyncio.sleep(e.value)
+            async for chunk in self.stream_file(message_id, offset, limit):
+                yield chunk
+        except StreamTimeout:
+            raise FileNotFound(f"Streaming timeout after {STREAM_TIMEOUT}s")
         except Exception as e:
-            logger.error(f"Error in _stream_media_chunks: {e}")
-            raise
-        return chunks
+            logger.error(f"Error streaming file {message_id}: {e}")
+            raise FileNotFound(f"Streaming error: {str(e)}")
 
     async def get_file_info(self, message_id: int) -> Dict[str, Any]:
         cache_key = f"{message_id}"
         if cache_key in metadata_cache:
             logger.debug(f"Cache hit for message {message_id}")
             return metadata_cache[cache_key]
-        async with semaphore:
-            try:
-                message = await self.get_message(message_id)
-                media = get_media(message)
-                if not media:
-                    return {"message_id": message.id, "error": "No media"}
-                file_info = {
-                    "message_id": message.id,
-                    "file_size": getattr(media, 'file_size', 0) or 0,
-                    "file_name": get_fname(message),
-                    "mime_type": getattr(media, 'mime_type', None) or "application/octet-stream",
-                    "unique_id": getattr(media, 'file_unique_id', None),
-                    "media_type": type(media).__name__.lower()
-                }
-                metadata_cache[cache_key] = file_info
-                return file_info
-            except Exception as e:
-                logger.debug(f"Error getting file info for {message_id}: {e}", exc_info=True)
-                return {"message_id": message_id, "error": str(e)}
+        
+        try:
+            message = await self.get_message(message_id)
+            media = get_media(message)
+            if not media:
+                return {"message_id": message.id, "error": "No media"}
+            
+            file_info = {
+                "message_id": message.id,
+                "file_size": getattr(media, 'file_size', 0) or 0,
+                "file_name": get_fname(message),
+                "mime_type": getattr(media, 'mime_type', None) or "application/octet-stream",
+                "unique_id": getattr(media, 'file_unique_id', None),
+                "media_type": type(media).__name__.lower()
+            }
+            metadata_cache[cache_key] = file_info
+            return file_info
+        except Exception as e:
+            logger.debug(f"Error getting file info for {message_id}: {e}")
+            return {"message_id": message_id, "error": str(e)}
 
 def get_streamer(client_id: int) -> ByteStreamer:
     if client_id not in streamers:
@@ -303,16 +272,6 @@ def parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
         )
     return start, end
 
-async def queue_worker():
-    while True:
-        task = await task_queue.get()
-        try:
-            await task
-        except Exception as e:
-            logger.error(f"Queue task error: {e}", exc_info=True)
-        finally:
-            task_queue.task_done()
-
 @routes.get("/")
 async def homepage(request: web.Request):
     return web.Response(text="File To Link API Is Alive ✅", content_type="text/plain")
@@ -326,22 +285,28 @@ async def media_delivery(request: web.Request):
         message_id, secure_hash, req_action = parse_media_request(f"{action}/{path}", request.query)
         if action != req_action:
             raise InvalidHash("Action mismatch in URL")
+        
         client_id, streamer = select_optimal_client()
         work_loads[client_id] += 1
+        
         try:
             file_info = await streamer.get_file_info(message_id)
             if not file_info.get('unique_id'):
                 raise FileNotFound("File unique ID not found.")
             if file_info['unique_id'][:SECURE_HASH_LENGTH] != secure_hash:
                 raise InvalidHash("Hash mismatch.")
+            
             file_size = file_info.get('file_size', 0)
             if file_size == 0:
                 raise FileNotFound("File size is zero.")
+            
             range_header = request.headers.get("Range", "")
             start, end = parse_range_header(range_header, file_size)
             content_length = end - start + 1
+            
             mime_type = file_info.get('mime_type') or 'application/octet-stream'
             filename = file_info.get('file_name') or f"file_{secrets.token_hex(4)}"
+            
             headers = {
                 "Content-Type": mime_type,
                 "Content-Length": str(content_length),
@@ -350,14 +315,17 @@ async def media_delivery(request: web.Request):
                 "Cache-Control": "public, max-age=31536000",
                 "Connection": "keep-alive"
             }
+            
             if range_header:
                 headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            
             logger.debug(f"{'Streaming' if action == 'stream' else 'Downloading'} file {message_id} with range {start}-{end}")
             
             async def stream_generator():
                 try:
                     bytes_sent = 0
                     bytes_to_skip = start % CHUNK_SIZE
+                    
                     async for chunk in streamer.stream_file(message_id, offset=start, limit=content_length):
                         if bytes_to_skip > 0:
                             if len(chunk) <= bytes_to_skip:
@@ -365,36 +333,45 @@ async def media_delivery(request: web.Request):
                                 continue
                             chunk = chunk[bytes_to_skip:]
                             bytes_to_skip = 0
+                        
                         remaining = content_length - bytes_sent
                         if len(chunk) > remaining:
                             chunk = chunk[:remaining]
+                        
                         if chunk:
                             yield chunk
                             bytes_sent += len(chunk)
+                        
                         if bytes_sent >= content_length:
                             break
+                            
+                except Exception as e:
+                    logger.error(f"Error in stream_generator: {e}")
+                    raise
                 finally:
                     work_loads[client_id] -= 1
-                    
+            
             return web.Response(
                 status=206 if range_header else 200,
                 body=stream_generator(),
                 headers=headers
             )
+            
         except (FileNotFound, InvalidHash):
             work_loads[client_id] -= 1
             raise
         except Exception as e:
             work_loads[client_id] -= 1
             error_id = secrets.token_hex(6)
-            logger.error(f"Stream error {error_id}: {e}", exc_info=True)
+            logger.error(f"Stream error {error_id}: {e}")
             raise web.HTTPInternalServerError(text=f"Server error: {error_id}") from e
+            
     except (InvalidHash, FileNotFound) as e:
-        logger.debug(f"Client error: {type(e).__name__} - {e}", exc_info=True)
+        logger.debug(f"Client error: {type(e).__name__} - {e}")
         raise web.HTTPNotFound(text=f"Resource not found: {str(e)}") from e
     except Exception as e:
         error_id = secrets.token_hex(6)
-        logger.error(f"Server error {error_id}: {e}", exc_info=True)
+        logger.error(f"Server error {error_id}: {e}")
         raise web.HTTPInternalServerError(text=f"Server error: {error_id}") from e
 
 @routes.get(r"/api/link/{path:.+}")
@@ -405,7 +382,9 @@ async def api_link(request: web.Request):
         message_id, secure_hash, req_action = parse_media_request(f"api/link/{path}", request.query)
         if req_action != "api/link":
             raise InvalidHash("Action mismatch in URL")
+        
         client_id, streamer = select_optimal_client()
+        
         try:
             file_info = await streamer.get_file_info(message_id)
             if not file_info.get('unique_id'):
@@ -413,17 +392,20 @@ async def api_link(request: web.Request):
                     "status": "error",
                     "message": "File unique ID not found."
                 }, status=404)
+            
             if file_info['unique_id'][:SECURE_HASH_LENGTH] != secure_hash:
                 return web.json_response({
                     "status": "error",
                     "message": "Hash mismatch."
                 }, status=400)
+            
             file_size = file_info.get('file_size', 0)
             if file_size == 0:
                 return web.json_response({
                     "status": "error",
                     "message": "File size is zero."
                 }, status=404)
+            
             base_url = "https://filetolink-production-f396.up.railway.app"
             return web.json_response({
                 "status": "success",
@@ -438,6 +420,7 @@ async def api_link(request: web.Request):
                     "download_link": f"{base_url}/download/{secure_hash}{message_id}"
                 }
             })
+            
         except (FileNotFound, InvalidHash) as e:
             return web.json_response({
                 "status": "error",
@@ -445,20 +428,21 @@ async def api_link(request: web.Request):
             }, status=404)
         except Exception as e:
             error_id = secrets.token_hex(6)
-            logger.error(f"API error {error_id}: {e}", exc_info=True)
+            logger.error(f"API error {error_id}: {e}")
             return web.json_response({
                 "status": "error",
                 "message": f"Server error: {error_id}"
             }, status=500)
+            
     except (InvalidHash, FileNotFound) as e:
-        logger.debug(f"Client error: {type(e).__name__} - {e}", exc_info=True)
+        logger.debug(f"Client error: {type(e).__name__} - {e}")
         return web.json_response({
             "status": "error",
             "message": f"Resource not found: {str(e)}"
         }, status=404)
     except Exception as e:
         error_id = secrets.token_hex(6)
-        logger.error(f"Server error {error_id}: {e}", exc_info=True)
+        logger.error(f"Server error {error_id}: {e}")
         return web.json_response({
             "status": "error",
             "message": f"Server error: {error_id}"
@@ -467,12 +451,12 @@ async def api_link(request: web.Request):
 async def main():
     await app.start()
     logger.info("API Pyrogram client started")
+    
     if not await check_channel_access(app, LOG_CHANNEL_ID):
         logger.error("API client failed to start: No access to LOG_CHANNEL")
         await app.stop()
         return
-    for _ in range(MAX_CONCURRENT_TASKS):
-        asyncio.create_task(queue_worker())
+    
     web_app = web.Application()
     web_app.add_routes(routes)
     runner = web.AppRunner(web_app)
@@ -480,7 +464,13 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', 8000)
     await site.start()
     logger.info("Web server started on port 8000")
-    await asyncio.Event().wait()
+    
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        await app.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())

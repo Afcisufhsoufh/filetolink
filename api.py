@@ -204,6 +204,8 @@ def get_streamer(client_id: int) -> ByteStreamer:
 
 def parse_media_request(path: str, query: dict) -> tuple[int, str, str]:
     clean_path = path.strip('/')
+    if clean_path.startswith('/'):
+        clean_path = clean_path[1:]  # Remove extra leading slashes
     match = PATTERN_HASH_FIRST.match(clean_path)
     if match:
         try:
@@ -213,8 +215,13 @@ def parse_media_request(path: str, query: dict) -> tuple[int, str, str]:
             if len(secure_hash) == SECURE_HASH_LENGTH and VALID_HASH_REGEX.match(secure_hash):
                 logger.debug(f"Parsed request: action={action}, secure_hash={secure_hash}, message_id={message_id}")
                 return message_id, secure_hash, action
+            else:
+                logger.error(f"Invalid hash length or format: {secure_hash}")
+                raise InvalidHash(f"Hash length must be {SECURE_HASH_LENGTH} or invalid characters")
         except ValueError as e:
+            logger.error(f"Invalid message ID format in path {clean_path}: {e}")
             raise InvalidHash(f"Invalid message ID format: {e}") from e
+    logger.error(f"Invalid URL structure for path: {clean_path}")
     raise InvalidHash("Invalid URL structure or missing hash")
 
 def select_optimal_client() -> tuple[int, ByteStreamer]:
@@ -323,7 +330,7 @@ async def media_delivery(request: web.Request):
             raise web.HTTPInternalServerError(text=f"Server error: {error_id}") from e
     except (InvalidHash, FileNotFound) as e:
         logger.debug(f"Client error: {type(e).__name__} - {e}", exc_info=True)
-        raise web.HTTPNotFound(text="Resource not found") from e
+        raise web.HTTPNotFound(text=f"Resource not found: {str(e)}") from e
     except Exception as e:
         error_id = secrets.token_hex(6)
         logger.error(f"Server error {error_id}: {e}", exc_info=True)
@@ -386,7 +393,7 @@ async def api_link(request: web.Request):
         logger.debug(f"Client error: {type(e).__name__} - {e}", exc_info=True)
         return web.json_response({
             "status": "error",
-            "message": "Resource not found"
+            "message": f"Resource not found: {str(e)}"
         }, status=404)
     except Exception as e:
         error_id = secrets.token_hex(6)

@@ -15,15 +15,15 @@ from config import LOG_CHANNEL_ID, API_ID, API_HASH, BOT_TOKEN
 from pyrogram.enums import ChatMemberStatus
 
 SECURE_HASH_LENGTH = 6
-# Increased chunk size for better throughput
-CHUNK_SIZE = 1024 * 1024 * 8  # 8MB chunks instead of 4MB
-# Increased concurrent tasks for better parallelism
-MAX_CONCURRENT_TASKS = 50
+# Optimized chunk size for better performance
+CHUNK_SIZE = 1024 * 1024 * 16  # 16MB chunks for maximum throughput
+# More concurrent tasks for high-load scenarios  
+MAX_CONCURRENT_TASKS = 100
 CACHE_TTL = 3600
-# Increased timeout for large files
-STREAM_TIMEOUT = 120  # 2 minutes instead of 30 seconds
-# Add buffer size for smoother streaming
-BUFFER_SIZE = 1024 * 1024 * 16  # 16MB buffer
+# Extended timeout for very large files
+STREAM_TIMEOUT = 300  # 5 minutes
+# Add prefetch buffer for smoother streaming
+PREFETCH_SIZE = 1024 * 1024 * 32  # 32MB prefetch buffer
 
 routes = web.RouteTableDef()
 work_loads = {0: 0}
@@ -169,88 +169,73 @@ class ByteStreamer:
             raise FileNotFound(f"Message {message_id} not found") from e
 
     async def stream_file(self, message_id: int, offset: int = 0, limit: int = 0) -> AsyncGenerator[bytes, None]:
-        async with self._semaphore:  # Limit concurrent streams
+        async with self._semaphore:
             message = await self.get_message(message_id)
-            
-            # Calculate chunk parameters more efficiently
-            chunk_offset = offset
-            chunk_limit = limit if limit > 0 else 0
             
             logger.debug(f"Streaming file {message_id} with offset {offset} and limit {limit}")
             
-            start_time = dt.now()
-            buffer = bytearray()
             bytes_yielded = 0
+            max_retries = 3
+            retry_count = 0
             
-            try:
-                # Use more efficient streaming parameters
-                if chunk_limit > 0:
-                    stream_iter = self.client.stream_media(
-                        message, 
-                        offset=chunk_offset, 
-                        limit=chunk_limit
-                    )
-                else:
-                    stream_iter = self.client.stream_media(message, offset=chunk_offset)
-                
-                async for chunk in stream_iter:
-                    current_time = dt.now()
-                    duration = (current_time - start_time).total_seconds()
+            while retry_count < max_retries:
+                try:
+                    # Calculate Telegram chunk offset (Telegram uses different chunking)
+                    tg_offset = (offset + bytes_yielded) // CHUNK_SIZE
+                    remaining_limit = limit - bytes_yielded if limit > 0 else 0
                     
-                    # More lenient timeout for large files
-                    if duration > STREAM_TIMEOUT:
-                        logger.error(f"Streaming timed out for message {message_id} after {STREAM_TIMEOUT}s")
-                        raise StreamTimeout(f"Streaming timeout after {STREAM_TIMEOUT}s")
+                    # Stream with proper parameters
+                    if remaining_limit > 0:
+                        stream_iter = self.client.stream_media(message, offset=tg_offset, limit=remaining_limit)
+                    else:
+                        stream_iter = self.client.stream_media(message, offset=tg_offset)
                     
-                    # Buffer chunks for smoother delivery
-                    buffer.extend(chunk)
+                    # Track bytes to skip at start of first chunk
+                    bytes_to_skip = (offset + bytes_yielded) % CHUNK_SIZE
                     
-                    # Yield buffered data when buffer is large enough or at end
-                    while len(buffer) >= CHUNK_SIZE:
-                        chunk_to_yield = bytes(buffer[:CHUNK_SIZE])
-                        buffer = buffer[CHUNK_SIZE:]
+                    async for chunk in stream_iter:
+                        # Skip bytes at the beginning if needed
+                        if bytes_to_skip > 0:
+                            if len(chunk) <= bytes_to_skip:
+                                bytes_to_skip -= len(chunk)
+                                continue
+                            chunk = chunk[bytes_to_skip:]
+                            bytes_to_skip = 0
                         
-                        # Check limit
-                        if limit > 0 and bytes_yielded + len(chunk_to_yield) > limit:
+                        # Apply limit if specified
+                        if limit > 0:
                             remaining = limit - bytes_yielded
-                            if remaining > 0:
-                                yield chunk_to_yield[:remaining]
-                                bytes_yielded += remaining
-                            break
+                            if remaining <= 0:
+                                return
+                            if len(chunk) > remaining:
+                                chunk = chunk[:remaining]
                         
-                        yield chunk_to_yield
-                        bytes_yielded += len(chunk_to_yield)
-                        
+                        if chunk:
+                            yield chunk
+                            bytes_yielded += len(chunk)
+                            
+                        # Check if we've reached the limit
                         if limit > 0 and bytes_yielded >= limit:
-                            break
+                            return
                     
-                    if limit > 0 and bytes_yielded >= limit:
-                        break
-                
-                # Yield remaining buffer
-                if buffer and (limit == 0 or bytes_yielded < limit):
-                    remaining_data = bytes(buffer)
-                    if limit > 0:
-                        remaining_bytes = limit - bytes_yielded
-                        if remaining_bytes > 0:
-                            remaining_data = remaining_data[:remaining_bytes]
-                    if remaining_data:
-                        yield remaining_data
-                        bytes_yielded += len(remaining_data)
-                
-                logger.debug(f"Completed streaming file {message_id}, total bytes: {bytes_yielded}")
-                
-            except FloodWait as e:
-                logger.debug(f"FloodWait: stream_file, sleep {e.value}s")
-                await asyncio.sleep(e.value)
-                # Retry with updated offset
-                async for chunk in self.stream_file(message_id, offset + bytes_yielded, limit - bytes_yielded if limit > 0 else 0):
-                    yield chunk
-            except StreamTimeout:
-                raise FileNotFound(f"Streaming timeout after {STREAM_TIMEOUT}s")
-            except Exception as e:
-                logger.error(f"Error streaming file {message_id}: {e}")
-                raise FileNotFound(f"Streaming error: {str(e)}")
+                    # If we get here, streaming completed successfully
+                    logger.debug(f"Completed streaming file {message_id}, total bytes: {bytes_yielded}")
+                    return
+                    
+                except FloodWait as e:
+                    logger.debug(f"FloodWait: stream_file, sleep {e.value}s, retry {retry_count + 1}")
+                    await asyncio.sleep(e.value)
+                    retry_count += 1  # Don't increment for FloodWait
+                    continue
+                    
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        logger.error(f"Error streaming file {message_id} after {max_retries} retries: {e}")
+                        raise FileNotFound(f"Streaming error: {str(e)}")
+                    
+                    logger.debug(f"Streaming error, retry {retry_count}: {e}")
+                    await asyncio.sleep(1)  # Brief pause before retry
 
     async def get_file_info(self, message_id: int) -> Dict[str, Any]:
         cache_key = f"info_{message_id}"
@@ -360,7 +345,7 @@ async def media_delivery(request: web.Request):
             mime_type = file_info.get('mime_type') or 'application/octet-stream'
             filename = file_info.get('file_name') or f"file_{secrets.token_hex(4)}"
             
-            # Optimized headers for better streaming
+            # Optimized headers for maximum streaming performance
             headers = {
                 "Content-Type": mime_type,
                 "Content-Length": str(content_length),
@@ -368,11 +353,12 @@ async def media_delivery(request: web.Request):
                 "Accept-Ranges": "bytes",
                 "Cache-Control": "public, max-age=31536000, immutable",
                 "Connection": "keep-alive",
-                "Transfer-Encoding": "chunked" if not range_header else None
+                "X-Accel-Buffering": "no",  # Disable nginx buffering for faster streaming
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Access-Control-Allow-Headers": "Range, Content-Range",
+                "Vary": "Accept-Encoding"
             }
-            
-            # Remove None values
-            headers = {k: v for k, v in headers.items() if v is not None}
             
             if range_header:
                 headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
@@ -498,20 +484,24 @@ async def main():
     
     # Configure web app for better performance
     web_app = web.Application(
-        client_max_size=1024**3,  # 1GB max request size
-        client_timeout=aiohttp.ClientTimeout(total=300, connect=30)  # 5 min timeout
+        client_max_size=1024**3  # 1GB max request size
     )
     web_app.add_routes(routes)
     
-    runner = web.AppRunner(web_app)
+    # Configure timeout for the runner
+    runner = web.AppRunner(
+        web_app,
+        keepalive_timeout=300,  # 5 minutes
+        client_timeout=300      # 5 minutes
+    )
     await runner.setup()
     
-    # Use more workers for better concurrency
+    # Use optimized TCP site settings
     site = web.TCPSite(
         runner, 
         '0.0.0.0', 
         8000,
-        backlog=1024,  # Increased backlog
+        backlog=1024,
         reuse_address=True,
         reuse_port=True
     )

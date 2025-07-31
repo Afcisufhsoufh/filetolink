@@ -3,3 +3,4 @@ asyncio
 aiohttp
 cachetools
 python-dateutil
+tgcrypto

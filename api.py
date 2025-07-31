@@ -15,9 +15,10 @@ from config import LOG_CHANNEL_ID, API_ID, API_HASH, BOT_TOKEN
 from pyrogram.enums import ChatMemberStatus
 
 SECURE_HASH_LENGTH = 6
-CHUNK_SIZE = 1024 * 1024
-MAX_CONCURRENT_TASKS = 10
+CHUNK_SIZE = 1024 * 1024 * 4  # Increased to 4MB for faster streaming
+MAX_CONCURRENT_TASKS = 20  # Increased to handle more concurrent streams
 CACHE_TTL = 3600
+STREAM_TIMEOUT = 30  # Timeout for streaming in seconds
 
 routes = web.RouteTableDef()
 work_loads = {0: 0}
@@ -177,17 +178,25 @@ class ByteStreamer:
     async def stream_file(self, message_id: int, offset: int = 0, limit: int = 0) -> AsyncGenerator[bytes, None]:
         async with semaphore:
             message = await self.get_message(message_id)
-            chunk_offset = offset // (1024 * 1024)
-            chunk_limit = (limit + (1024 * 1024) - 1) // (1024 * 1024) if limit > 0 else 0
+            chunk_offset = offset // CHUNK_SIZE
+            chunk_limit = (limit + CHUNK_SIZE - 1) // CHUNK_SIZE if limit > 0 else 0
             logger.debug(f"Streaming file {message_id} with offset {offset} and limit {limit}")
-            while True:
-                try:
-                    async for chunk in self.client.stream_media(message, offset=chunk_offset, limit=chunk_limit):
-                        yield chunk
-                    break
-                except FloodWait as e:
-                    logger.debug(f"FloodWait: stream_file, sleep {e.value}s")
-                    await asyncio.sleep(e.value)
+            start_time = dt.now()
+            try:
+                async for chunk in self.client.stream_media(message, offset=chunk_offset, limit=chunk_limit, timeout=STREAM_TIMEOUT):
+                    duration = (dt.now() - start_time).total_seconds()
+                    logger.debug(f"Streamed chunk for message {message_id}, duration: {duration:.2f}s")
+                    yield chunk
+                logger.debug(f"Completed streaming file {message_id}")
+            except asyncio.TimeoutError:
+                logger.error(f"Streaming timed out for message {message_id} after {STREAM_TIMEOUT}s")
+                raise FileNotFound(f"Streaming timeout after {STREAM_TIMEOUT}s")
+            except FloodWait as e:
+                logger.debug(f"FloodWait: stream_file, sleep {e.value}s")
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                logger.error(f"Error streaming file {message_id}: {e}", exc_info=True)
+                raise FileNotFound(f"Streaming error: {str(e)}")
 
     async def get_file_info(self, message_id: int) -> Dict[str, Any]:
         cache_key = f"{message_id}"

@@ -15,7 +15,7 @@ class Telegram:
     CHANNEL_ID = -1002735511721
 
 class Server:
-    BASE_URL = "https://a18f8c08-d222-4185-8ebf-75eeafb751bd-00-1c2bh2xulsivq.sisko.replit.dev"
+    BASE_URL = "https://filetolink-production-f396.up.railway.app"
     BIND_ADDRESS = "0.0.0.0"
     PORT = 8000
 

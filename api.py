@@ -132,7 +132,7 @@ async def transmit_file(file_id):
         logger.error("Invalid range request - Bytes: %s-%s/%s", from_bytes, until_bytes, file_size)
         await return_streaming_api(selected_api)
         abort(416, "Invalid range.")
-    chunk_size = 512 * 1024  # Reduced to 512 KB for faster delivery
+    chunk_size = 512 * 1024
     until_bytes = min(until_bytes, file_size - 1)
     offset = from_bytes - (from_bytes % chunk_size)
     first_part_cut = from_bytes - offset
@@ -149,7 +149,7 @@ async def transmit_file(file_id):
     logger.info("Starting file stream - API: %s, Chunks: %s, Chunk size: %s", api_name, part_count, chunk_size)
     async def file_generator():
         current_part = 1
-        prefetch_buffer = asyncio.Queue(maxsize=10)  # Reduced buffer size
+        prefetch_buffer = asyncio.Queue(maxsize=10)
         async def prefetch_chunks():
             retries = 3
             async for chunk in selected_api.iter_download(
@@ -235,32 +235,6 @@ async def stream_file(file_id):
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@500;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        .downloadBtn button {
-            display: inline-block !important;
-            visibility: visible !important;
-            opacity: 1 !important;
-            margin: 10px;
-            padding: 10px 20px;
-            background-color: #1a73e8;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-        }
-        .downloadBtn button:hover {
-            background-color: #1557b0;
-        }
-        .downloadBtn img {
-            vertical-align: middle;
-            margin-right: 5px;
-        }
-        #error-message {
-            color: red;
-            text-align: center;
-            margin-top: 20px;
-        }
-    </style>
 </head>
 <body>
     <nav>
@@ -284,10 +258,7 @@ async def stream_file(file_id):
     <div class="outer">
         <div class="inner">
             <div class="main" id="main">
-                <video id="player" class="player" playsinline controls>
-                    <source src="{{file_url}}" type="{{mime_type}}">
-                    <p>Your browser doesn't support HTML5 video.</p>
-                </video>
+                <video id="player" class="player" src="{{file_url}}" type="video/mp4" playsinline controls></video>
                 <div class="player"></div>
                 <div class="file-name">
                     <h4 style="display: inline;">File Name: </h4>
@@ -297,29 +268,28 @@ async def stream_file(file_id):
                 </div>
                 <div class="downloadBtn">
                     <button class="magnet" onclick="streamDownload()">
-                        <img style="height: 30px;" src="https://i.ibb.co/RjzYttX/dl.png" alt="Download">download video
+                        <img style="height: 30px;" src="https://i.ibb.co/RjzYttX/dl.png" alt="">download video
                     </button>
                     <button class="magnet" onclick="copyStreamLink()">
                         <img src="https://i.ibb.co/CM4Y586/link.png" alt="Copy Link">copy link
                     </button>
                     <button class="magnet" onclick="vlc_player()">
-                        <img src="https://i.ibb.co/px6fQs1/vlc.png" alt="VLC">watch in VLC PLAYER
+                        <img src="https://i.ibb.co/px6fQs1/vlc.png" alt="">watch in VLC PLAYER
                     </button>
                     <button class="magnet" onclick="mx_player()">
-                        <img src="https://i.ibb.co/41WvtQ3/mx.png" alt="MX">watch in MX PLAYER
+                        <img src="https://i.ibb.co/41WvtQ3/mx.png" alt="">watch in MX PLAYER
                     </button>
                     <button class="magnet" onclick="n_player()">
-                        <img src="https://i.ibb.co/Hd2dS4t/nPlayer.png" alt="nPlayer">watch in nPlayer
+                        <img src="https://i.ibb.co/Hd2dS4t/nPlayer.png" alt="">watch in nPlayer
                     </button>
                 </div>
-                <div id="error-message"></div>
             </div>
             <div class="abt">
                 <div class="about">
                     <div class="about-dets">
                         <div class="abt-sec" id="abtus" style="padding: 160px 30px;">
-                            <h1 style="text-align: center;">WELCOME TO OUR <span>FILE STREAM</span> BOT</h1>
-                            <p style="text-align: center; line-height: 2; word-spacing: 2px; letter-spacing: 0.8px;">
+                            <h1 style="text-align: center;">WELCOME TO OUR <Span>FILE STREAM</Span> BOT</h1>
+                            <p style="text-align: center; line-height: 2;word-spacing: 2px; letter-spacing: 0.8px;">
                                 This is a Telegram Bot to Stream <span>Files</span> and <span>Media</span> directly on
                                 Telegram. You can also
                                 <span>download</span> them if you want. This bot is developed by <a
@@ -368,64 +338,25 @@ async def stream_file(file_id):
     <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/ScrollTrigger.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.155.0/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/automat/controlkit.js@master/bin/controlKit.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/sheryjs/dist/Shery.js"></script>
-    <script src="https://cdn.plyr.io/3.6.9/plyr.js"></script>
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/sheryjs/dist/Shery.js"></script>
     <script>
         document.addEventListener("DOMContentLoaded", function () {
-            try {
-                const player = new Plyr("#player", {
-                    controls: ["play-large", "rewind", "play", "fast-forward", "progress", "current-time", "mute", "settings", "pip", "fullscreen"],
-                    settings: ["speed", "loop"],
-                    speed: { selected: 1, options: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] },
-                    seek: 10,
-                    keyboard: { focused: true, global: true }
+            const uncopyableElement = document.querySelector(".uncopyable");
+            if (uncopyableElement) {
+                uncopyableElement.addEventListener("selectstart", function (event) {
+                    event.preventDefault();
                 });
-                player.on('error', function(e) {
-                    document.getElementById("error-message").textContent = "Error loading video: " + e.message;
-                });
-                window.streamDownload = function() {
-                    const link = document.createElement("a");
-                    link.href = "{{file_url}}";
-                    link.download = "{{file_name}}";
-                    document.body.appendChild(link);
-                    link.click();
-                    document.body.removeChild(link);
-                };
-                window.copyStreamLink = function() {
-                    navigator.clipboard.writeText("{{file_url}}").then(() => {
-                        alert("Link copied to clipboard!");
-                    }).catch(err => {
-                        document.getElementById("error-message").textContent = "Failed to copy link: " + err;
-                    });
-                };
-                window.vlc_player = function() {
-                    window.location.href = "vlc://{{file_url}}";
-                };
-                window.mx_player = function() {
-                    window.location.href = "intent://{{file_url}}#Intent;package=com.mxtech.videoplayer.ad;end";
-                };
-                window.n_player = function() {
-                    window.location.href = "nplayer-{{file_url}}";
-                };
-                const uncopyableElement = document.querySelector(".uncopyable");
-                if (uncopyableElement) {
-                    uncopyableElement.addEventListener("selectstart", function (event) {
-                        event.preventDefault();
-                    });
-                }
-            } catch (e) {
-                document.getElementById("error-message").textContent = "Error initializing player: " + e.message;
             }
         });
     </script>
+    <script src="https://cdn.plyr.io/3.6.9/plyr.js"></script>
     <script src="https://Jisshubot.github.io/data/fs/src/script.js"></script>
 </body>
 </html>
 """,
             file_url=f"{base_url}/dl/{file_id}?code={quoted_code}",
             file_name=file_name,
-            file_size=f"{file_size / (1024 * 1024):.2f} MB",  # Convert to MB for readability
-            mime_type=mime_type
+            file_size=f"{file_size / (1024 * 1024):.2f} MB"
         )
     except Exception as e:
         await return_streaming_api(selected_api)

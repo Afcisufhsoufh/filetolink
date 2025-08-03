@@ -7,6 +7,7 @@ from math import ceil, floor
 import logging
 import asyncio
 import urllib.parse
+from queue import Queue
 
 class Telegram:
     API_ID = 28239710
@@ -35,6 +36,7 @@ error_messages = {
     404: "File not found.",
     416: "Invalid range.",
     500: "Internal server error.",
+    503: "No available API instance.",
 }
 
 def abort(status_code: int = 500, description: str = None):
@@ -70,25 +72,39 @@ class FileLinkAPI(TelegramClient):
         super().__init__(session_name, api_id, api_hash, connection_retries=-1, timeout=120, flood_sleep_threshold=0)
         self.bot_token = bot_token
         self.base_url = Server.BASE_URL.rstrip('/')
-        self.in_use = False
 
     async def start_api(self):
         await self.start(bot_token=self.bot_token)
-        logger.info("FileLinkAPI started")
+        logger.info("FileLinkAPI started: %s", self.session_name)
+
+# Initialize pool of API instances
+api_pool = Queue()
+NUM_API_INSTANCES = 3
+for i in range(NUM_API_INSTANCES):
+    api = FileLinkAPI(
+        session_name=f"file_link_api_{i}",
+        api_id=Telegram.API_ID,
+        api_hash=Telegram.API_HASH,
+        bot_token=Telegram.BOT_TOKEN
+    )
+    api_pool.put(api)
+
+async def get_streaming_api():
+    try:
+        api = api_pool.get_nowait()
+        logger.info("Acquired API instance: %s", api.session_name)
+        return api
+    except asyncio.QueueEmpty:
+        logger.warning("No available API instances in pool")
+        raise HTTPError(503, "No available API instance.")
+
+async def return_streaming_api(api):
+    api_pool.put(api)
+    logger.info("Returned API instance to pool: %s", api.session_name)
 
 app = Quart(__name__)
 app.config["RESPONSE_TIMEOUT"] = None
 bp = Blueprint("main", __name__)
-
-async def get_streaming_api():
-    api = api_instance
-    if api.in_use:
-        raise HTTPError(503, "No available API instance.")
-    api.in_use = True
-    return api
-
-async def return_streaming_api(api):
-    api.in_use = False
 
 @bp.route("/")
 async def home():
@@ -132,7 +148,7 @@ async def transmit_file(file_id):
         logger.error("Invalid range request - Bytes: %s-%s/%s", from_bytes, until_bytes, file_size)
         await return_streaming_api(selected_api)
         abort(416, "Invalid range.")
-    chunk_size = 512 * 1024
+    chunk_size = 512 * 1024  # Reverted to 512 KB
     until_bytes = min(until_bytes, file_size - 1)
     offset = from_bytes - (from_bytes % chunk_size)
     first_part_cut = from_bytes - offset
@@ -145,11 +161,12 @@ async def transmit_file(file_id):
         "Content-Length": str(req_length),
         "Content-Disposition": f'attachment; filename="{file_name}"',
         "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=3600",  # Cache metadata for 1 hour
     }
     logger.info("Starting file stream - API: %s, Chunks: %s, Chunk size: %s", api_name, part_count, chunk_size)
     async def file_generator():
         current_part = 1
-        prefetch_buffer = asyncio.Queue(maxsize=10)
+        prefetch_buffer = asyncio.Queue(maxsize=5)  # Reduced buffer size
         async def prefetch_chunks():
             retries = 3
             async for chunk in selected_api.iter_download(
@@ -158,6 +175,7 @@ async def transmit_file(file_id):
                 chunk_size=chunk_size,
                 stride=chunk_size,
                 file_size=file_size,
+                request_size=chunk_size  # Align request size with chunk size
             ):
                 for attempt in range(retries):
                     try:
@@ -168,19 +186,19 @@ async def transmit_file(file_id):
                         logger.warning("Chunk fetch attempt %d failed: %s", attempt + 1, e)
                         if attempt == retries - 1:
                             raise
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(0.5)  # Reduced retry delay
         prefetch_task = asyncio.create_task(prefetch_chunks())
         try:
             while current_part <= part_count:
                 try:
-                    chunk, start_time = await asyncio.wait_for(prefetch_buffer.get(), timeout=5.0)
+                    chunk, start_time = await asyncio.wait_for(prefetch_buffer.get(), timeout=3.0)  # Reduced timeout
                 except asyncio.TimeoutError:
                     logger.warning("Prefetch timeout - slow network? Retrying...")
                     continue
                 if not chunk:
                     break
                 elapsed = asyncio.get_event_loop().time() - start_time
-                if elapsed > 0.5:
+                if elapsed > 0.3:  # Tighter threshold for logging
                     logger.warning("Slow chunk fetch: %.2f seconds", elapsed)
                 if part_count == 1:
                     yield chunk[first_part_cut:last_part_cut]
@@ -347,6 +365,29 @@ async def stream_file(file_id):
                     event.preventDefault();
                 });
             }
+            // Fallback functions in case script.js fails
+            window.streamDownload = window.streamDownload || function() {
+                const link = document.createElement("a");
+                link.href = "{{file_url}}";
+                link.download = "{{file_name}}";
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+            window.copyStreamLink = window.copyStreamLink || function() {
+                navigator.clipboard.writeText("{{file_url}}").then(() => {
+                    alert("Link copied to clipboard!");
+                });
+            };
+            window.vlc_player = window.vlc_player || function() {
+                window.location.href = "vlc://{{file_url}}";
+            };
+            window.mx_player = window.mx_player || function() {
+                window.location.href = "intent://{{file_url}}#Intent;package=com.mxtech.videoplayer.ad;end";
+            };
+            window.n_player = window.n_player || function() {
+                window.location.href = "nplayer-{{file_url}}";
+            };
         });
     </script>
     <script src="https://cdn.plyr.io/3.6.9/plyr.js"></script>
@@ -382,16 +423,15 @@ app.register_error_handler(404, not_found)
 app.register_error_handler(405, invalid_method)
 app.register_error_handler(HTTPError, http_error)
 
-api_instance = FileLinkAPI(
-    session_name="file_link_api",
-    api_id=Telegram.API_ID,
-    api_hash=Telegram.API_HASH,
-    bot_token=Telegram.BOT_TOKEN
-)
+async def start_api_pool():
+    for _ in range(NUM_API_INSTANCES):
+        api = api_pool.get()
+        await api.start_api()
+        api_pool.put(api)
 
 async def main():
-    await api_instance.start_api()
-    logger.info("API running, starting web server...")
+    await start_api_pool()
+    logger.info("API pool initialized with %d instances", NUM_API_INSTANCES)
     from uvicorn import Server as UvicornServer, Config
     server = UvicornServer(Config(app=app, host=Server.BIND_ADDRESS, port=Server.PORT, log_config=None, timeout_keep_alive=120))
     logger.info("Web server is started! Running on %s:%s", Server.BIND_ADDRESS, Server.PORT)

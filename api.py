@@ -59,7 +59,7 @@ def get_file_properties(message: Message):
                 break
         else:
             abort(400, "Invalid media type.")
-        date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        date = datetime.strftime(datetime.now(), "%Y-%m-%d_%H-%M-%S")
         file_name = f"{file_type}-{date}.{file_format}"
     if not mime_type:
         mime_type = guess_type(file_name)[0] or "application/octet-stream"
@@ -132,7 +132,7 @@ async def transmit_file(file_id):
         logger.error("Invalid range request - Bytes: %s-%s/%s", from_bytes, until_bytes, file_size)
         await return_streaming_api(selected_api)
         abort(416, "Invalid range.")
-    chunk_size = 2 * 1024 * 1024  # 2 MB chunks for faster streaming
+    chunk_size = 2 * 1024 * 1024
     until_bytes = min(until_bytes, file_size - 1)
     offset = from_bytes - (from_bytes % chunk_size)
     first_part_cut = from_bytes - offset
@@ -149,7 +149,7 @@ async def transmit_file(file_id):
     logger.info("Starting file stream - API: %s, Chunks: %s, Chunk size: %s", api_name, part_count, chunk_size)
     async def file_generator():
         current_part = 1
-        prefetch_buffer = asyncio.Queue(maxsize=50)  # Larger buffer for large files
+        prefetch_buffer = asyncio.Queue(maxsize=50)
         async def prefetch_chunks():
             async for chunk in selected_api.iter_download(
                 file,
@@ -197,10 +197,190 @@ async def stream_file(file_id):
     code = request.args.get("code") or abort(401)
     quoted_code = urllib.parse.quote(code)
     base_url = Server.BASE_URL.rstrip('/')
-    return await render_template_string(
-        '<!DOCTYPE html><html lang="en"><head><title>Play Files</title><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="X-Frame-Options" content="deny"><link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" /><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css"><script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script><style>html, body { margin: 0; height: 100%; }#stream-media { height: 100%; width: 100%; }#error-message { color: red; font-size: 24px; text-align: center; margin-top: 20px; }.plyr__video-wrapper .plyr-download-button, .plyr__video-wrapper .plyr-share-button { position: absolute; top: 10px; left: 10px; width: 30px; height: 30px; background-color: rgba(0, 0, 0, 0.7); border-radius: 50%; text-align: center; line-height: 30px; color: white; z-index: 10; }.plyr__video-wrapper .plyr-share-button { top: 50px; }.plyr__video-wrapper .plyr-download-button:hover, .plyr__video-wrapper .plyr-share-button:hover { background-color: rgba(255, 255, 255, 0.7); color: black; }.plyr__video-wrapper .plyr-download-button:before { font-family: "Font Awesome 5 Free"; content: "\\f019"; font-weight: bold; }.plyr__video-wrapper .plyr-share-button:before { font-family: "Font Awesome 5 Free"; content: "\\f064"; font-weight: bold; }.plyr, .plyr__video-wrapper, .plyr__video-embed iframe { height: 100%; }</style></head><body><video id="stream-media" controls preload="auto"><source src="{{ mediaLink }}" type=""><p class="vjs-no-js">To view this video please enable JavaScript, and consider upgrading to a web browser that supports HTML5 video</p></video><div id="error-message"></div><script>var player = new Plyr("#stream-media", {controls: ["play-large", "rewind", "play", "fast-forward", "progress", "current-time", "mute", "settings", "pip", "fullscreen"],settings: ["speed", "loop"],speed: { selected: 1, options: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] },seek: 10,keyboard: { focused: true, global: true },});var mediaLink = "{{ mediaLink }}";if (mediaLink) {document.querySelector("#stream-media source").setAttribute("src", mediaLink);player.restart();var downloadButton = document.createElement("div");downloadButton.className = "plyr-download-button";downloadButton.onclick = function() {event.stopPropagation();var link = document.createElement("a");link.href = mediaLink;document.body.appendChild(link);link.click();document.body.removeChild(link);};player.elements.container.querySelector(".plyr__video-wrapper").appendChild(downloadButton);var shareButton = document.createElement("div");shareButton.className = "plyr-share-button";shareButton.onclick = function() {event.stopPropagation();if (navigator.share) {navigator.share({ title: "Play", url: mediaLink });}};player.elements.container.querySelector(".plyr__video-wrapper").appendChild(shareButton);} else {document.getElementById("error-message").textContent = "Error: Media URL not provided";}</script></body></html>',
-        mediaLink=f"{base_url}/dl/{file_id}?code={quoted_code}"
-    )
+    selected_api = await get_streaming_api()
+    try:
+        file = await selected_api.get_messages(Telegram.CHANNEL_ID, ids=int(file_id))
+        if not file:
+            logger.warning("Message %s not found in channel %s", file_id, Telegram.CHANNEL_ID)
+            await return_streaming_api(selected_api)
+            abort(404)
+        if code != file.raw_text:
+            logger.warning("Access denied - Invalid code for file %s: provided=%s, expected=%s", file_id, code, file.raw_text)
+            await return_streaming_api(selected_api)
+            abort(403)
+        file_name, file_size, mime_type = get_file_properties(file)
+        await return_streaming_api(selected_api)
+        return await render_template_string(
+            """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{file_name}}</title>
+    <link rel="icon" href="https://i.ibb.co/Hh4kF2b/icon.png" type="image/x-icon">
+    <link rel="shortcut icon" href="https://i.ibb.co/Hh4kF2b/icon.png" type="image/x-icon">
+    <link rel="stylesheet" href="https://unpkg.com/sheryjs/dist/Shery.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Jisshubot/data@main/fs/src/style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Jisshubot/data@main/fs/src/plyr.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <nav>
+        <div class="nleft">
+            <a href="#">
+                <h3 id="heading" style="z-index: 100;" class="magnet title">FILE STREAM BY @ISmartCoder </h3>
+            </a>
+        </div>
+        <div class="nryt">
+            <a class="home-btn magnet" href="#main" onclick="toggleWidthnav(this)">HOME</a>
+            <a href="#abtus" class="about-btn magnet" onclick="toggleWidthnav(this)">ABOUT</a>
+        </div>
+    </nav>
+    <center>
+        <div class="about-nav">
+            <a href="#abtus" class="wlcm magnet" onclick="toggleWidth(this)">WELCOME</a>
+            <a href="#channels" class="abt-chnl magnet" onclick="toggleWidth(this)">CHANNELS</a>
+            <a href="#contact" class="magnet contact-btn" onclick="toggleWidth(this)">CONTACT</a>
+        </div>
+    </center>
+    <div class="outer">
+        <div class="inner">
+            <div class="main" id="main">
+                <video id="player" class="player" src="{{file_url}}" type="video/mp4" playsinline controls></video>
+                <div class="player"></div>
+                <div class="file-name">
+                    <h4 style="display: inline;">File Name: </h4>
+                    <p style="display: inline;" id="myDiv">{{file_name}}</p><br>
+                    <h4 style="display: inline;">File Size: </h4>
+                    <p style="display: inline;">{{file_size}}</p>
+                </div>
+                <div class="downloadBtn">
+                    <button class="magnet" onclick="streamDownload()">
+                        <img style="height: 30px;" src="https://i.ibb.co/RjzYttX/dl.png" alt="">download video
+                    </button>
+                    <button class="magnet" onclick="copyStreamLink()">
+                        <img src="https://i.ibb.co/CM4Y586/link.png" alt="Copy Link">copy link
+                    </button>
+                    <button class="magnet" onclick="vlc_player()">
+                        <img src="https://i.ibb.co/px6fQs1/vlc.png" alt="">watch in VLC PLAYER
+                    </button>
+                    <button class="magnet" onclick="mx_player()">
+                        <img src="https://i.ibb.co/41WvtQ3/mx.png" alt="">watch in MX PLAYER
+                    </button>
+                    <button class="magnet" onclick="n_player()">
+                        <img src="https://i.ibb.co/Hd2dS4t/nPlayer.png" alt="">watch in nPlayer
+                    </button>
+                </div>
+            </div>
+            <div class="abt">
+                <div class="about">
+                    <div class="about-dets">
+                        <div class="abt-sec" id="abtus" style="padding: 160px 30px;">
+                            <h1 style="text-align: center;">WELCOME TO OUR <Span>FILE STREAM</Span> BOT</h1>
+                            <p style="text-align: center; line-height: 2;word-spacing: 2px; letter-spacing: 0.8px;">
+                                This is a Telegram Bot to Stream <span>Files</span> and <span>Media</span> directly on
+                                Telegram. You can also
+                                <span>download</span> them if you want. This bot is developed by <a
+                                    href="https://telegram.dog/ISmartCoder"><span style="font-weight: 700;">Abir Arafat Chawdhury</span></a>
+                                <br><br>If you like this bot, then don't
+                                forget to share it with your friends and family.
+                            </p>
+                        </div>
+                        <div class="abt-sec" id="channels">
+                            <h1>JOIN OUR <span>TELEGRAM</span> CHANNELS</h1>
+                            <div class="links chnl-link">
+                                <a class="magnet" href="https://t.me/TheSmartDev">
+                                    <button>BOTS CHANNEL</button>
+                                </a>
+                                <a class="magnet" href="https://t.me/Bot_Bug_Test">
+                                    <button>SUPPORT GROUP</button>
+                                </a>
+                                <a class="magnet" href="https://t.me/ISmartCoder">
+                                    <button>Dev's CHANNEL</button>
+                                </a>
+                            </div>
+                        </div>
+                        <div class="abt-sec" id="contact">
+                            <p style="text-align: center;">Report Bugs and Contact us on Telegram Below</p>
+                            <div class="links contact">
+                                <a href="https://t.me/ISmartCoder">
+                                    <button>CONTACT</button>
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <footer>
+            <center>
+                <div class="copyright">
+                    <h5 class="text-center">Copyright © 2024 <a href="https://telegram.dog/ISmartCoder"><span
+                                style="font-weight: 700;">TheSmartDev</span></a>. All
+                        Rights Reserved.</h5>
+                </div>
+            </center>
+        </footer>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/ScrollTrigger.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.155.0/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/automat/controlkit.js@master/bin/controlKit.min.js"></script>
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/sheryjs/dist/Shery.js"></script>
+    <script>
+        document.addEventListener("DOMContentLoaded", function () {
+            const uncopyableElement = document.querySelector(".uncopyable");
+            if (uncopyableElement) {
+                uncopyableElement.addEventListener("selectstart", function (event) {
+                    event.preventDefault();
+                });
+            }
+            const player = new Plyr("#player", {
+                controls: ["play-large", "rewind", "play", "fast-forward", "progress", "current-time", "mute", "settings", "pip", "fullscreen"],
+                settings: ["speed", "loop"],
+                speed: { selected: 1, options: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] },
+                seek: 10,
+                keyboard: { focused: true, global: true }
+            });
+            function streamDownload() {
+                const link = document.createElement("a");
+                link.href = "{{file_url}}";
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+            function copyStreamLink() {
+                navigator.clipboard.writeText("{{file_url}}").then(() => {
+                    alert("Link copied to clipboard!");
+                });
+            }
+            function vlc_player() {
+                window.location.href = "vlc://{{file_url}}";
+            }
+            function mx_player() {
+                window.location.href = "intent://{{file_url}}#Intent;package=com.mxtech.videoplayer.ad;end";
+            }
+            function n_player() {
+                window.location.href = "nplayer-{{file_url}}";
+            }
+        });
+    </script>
+    <script src="https://cdn.plyr.io/3.6.9/plyr.js"></script>
+    <script src="https://Jisshubot.github.io/data/fs/src/script.js"></script>
+</body>
+</html>
+""",
+            file_url=f"{base_url}/dl/{file_id}?code={quoted_code}",
+            file_name=file_name,
+            file_size=f"{file_size} bytes"
+        )
+    except Exception as e:
+        await return_streaming_api(selected_api)
+        logger.error("Error in stream_file: %s", e)
+        raise
 
 async def invalid_request(_):
     return "Invalid request.", 400

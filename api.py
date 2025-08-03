@@ -70,6 +70,7 @@ def get_file_properties(message: Message):
 class FileLinkAPI(TelegramClient):
     def __init__(self, session_name, api_id, api_hash, bot_token):
         super().__init__(session_name, api_id, api_hash, connection_retries=-1, timeout=120, flood_sleep_threshold=0)
+        self.session_name = session_name  # Store session_name
         self.bot_token = bot_token
         self.base_url = Server.BASE_URL.rstrip('/')
 
@@ -148,7 +149,7 @@ async def transmit_file(file_id):
         logger.error("Invalid range request - Bytes: %s-%s/%s", from_bytes, until_bytes, file_size)
         await return_streaming_api(selected_api)
         abort(416, "Invalid range.")
-    chunk_size = 512 * 1024  # Reverted to 512 KB
+    chunk_size = 512 * 1024
     until_bytes = min(until_bytes, file_size - 1)
     offset = from_bytes - (from_bytes % chunk_size)
     first_part_cut = from_bytes - offset
@@ -161,12 +162,12 @@ async def transmit_file(file_id):
         "Content-Length": str(req_length),
         "Content-Disposition": f'attachment; filename="{file_name}"',
         "Accept-Ranges": "bytes",
-        "Cache-Control": "public, max-age=3600",  # Cache metadata for 1 hour
+        "Cache-Control": "public, max-age=3600",
     }
     logger.info("Starting file stream - API: %s, Chunks: %s, Chunk size: %s", api_name, part_count, chunk_size)
     async def file_generator():
         current_part = 1
-        prefetch_buffer = asyncio.Queue(maxsize=5)  # Reduced buffer size
+        prefetch_buffer = asyncio.Queue(maxsize=5)
         async def prefetch_chunks():
             retries = 3
             async for chunk in selected_api.iter_download(
@@ -175,7 +176,7 @@ async def transmit_file(file_id):
                 chunk_size=chunk_size,
                 stride=chunk_size,
                 file_size=file_size,
-                request_size=chunk_size  # Align request size with chunk size
+                request_size=chunk_size
             ):
                 for attempt in range(retries):
                     try:
@@ -186,19 +187,19 @@ async def transmit_file(file_id):
                         logger.warning("Chunk fetch attempt %d failed: %s", attempt + 1, e)
                         if attempt == retries - 1:
                             raise
-                        await asyncio.sleep(0.5)  # Reduced retry delay
+                        await asyncio.sleep(0.5)
         prefetch_task = asyncio.create_task(prefetch_chunks())
         try:
             while current_part <= part_count:
                 try:
-                    chunk, start_time = await asyncio.wait_for(prefetch_buffer.get(), timeout=3.0)  # Reduced timeout
+                    chunk, start_time = await asyncio.wait_for(prefetch_buffer.get(), timeout=3.0)
                 except asyncio.TimeoutError:
                     logger.warning("Prefetch timeout - slow network? Retrying...")
                     continue
                 if not chunk:
                     break
                 elapsed = asyncio.get_event_loop().time() - start_time
-                if elapsed > 0.3:  # Tighter threshold for logging
+                if elapsed > 0.3:
                     logger.warning("Slow chunk fetch: %.2f seconds", elapsed)
                 if part_count == 1:
                     yield chunk[first_part_cut:last_part_cut]
@@ -365,7 +366,7 @@ async def stream_file(file_id):
                     event.preventDefault();
                 });
             }
-            // Fallback functions in case script.js fails
+            // Fallback functions
             window.streamDownload = window.streamDownload || function() {
                 const link = document.createElement("a");
                 link.href = "{{file_url}}";
@@ -424,14 +425,17 @@ app.register_error_handler(405, invalid_method)
 app.register_error_handler(HTTPError, http_error)
 
 async def start_api_pool():
-    for _ in range(NUM_API_INSTANCES):
+    tasks = []
+    while not api_pool.empty():
         api = api_pool.get()
-        await api.start_api()
+        tasks.append(api.start_api())
         api_pool.put(api)
+    await asyncio.gather(*tasks)
+    logger.info("API pool initialized with %d instances", NUM_API_INSTANCES)
 
 async def main():
     await start_api_pool()
-    logger.info("API pool initialized with %d instances", NUM_API_INSTANCES)
+    logger.info("API pool running, starting web server...")
     from uvicorn import Server as UvicornServer, Config
     server = UvicornServer(Config(app=app, host=Server.BIND_ADDRESS, port=Server.PORT, log_config=None, timeout_keep_alive=120))
     logger.info("Web server is started! Running on %s:%s", Server.BIND_ADDRESS, Server.PORT)

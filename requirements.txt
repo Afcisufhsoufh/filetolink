@@ -1,6 +1,5 @@
-pyrofork 
+telethon
+cryptg
 asyncio
-aiohttp
-cachetools
+quart
 python-dateutil
-tgcrypto

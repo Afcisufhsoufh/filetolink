@@ -1,12 +1,20 @@
+import sys
+import logging
+import asyncio
+import os
+import urllib.parse
 from quart import Quart, Blueprint, Response, request, render_template_string
 from telethon import TelegramClient
 from telethon.tl.custom import Message
 from datetime import datetime
 from mimetypes import guess_type
 from math import ceil, floor
-import logging
-import asyncio
-import urllib.parse
+import uvicorn
+
+# Initialize logging immediately
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", handlers=[logging.StreamHandler(sys.stderr)])
+logger = logging.getLogger(__name__)
+logger.info("Starting api.py, Python version: %s", sys.version)
 
 class Telegram:
     API_ID = 28239710
@@ -15,12 +23,8 @@ class Telegram:
     CHANNEL_ID = -1002735511721
 
 class Server:
-    BASE_URL = "https://filetolink-production-f396.up.railway.app"
     BIND_ADDRESS = "0.0.0.0"
-    PORT = 8000
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+    PORT = int(os.environ.get("PORT", 8000))
 
 class HTTPError(Exception):
     def __init__(self, status_code, description=None):
@@ -66,15 +70,20 @@ def get_file_properties(message: Message):
     return file_name, file_size, mime_type
 
 class FileLinkAPI(TelegramClient):
-    def __init__(self, session_name, api_id, api_hash, bot_token):
-        super().__init__(session_name, api_id, api_hash, connection_retries=-1, timeout=120, flood_sleep_threshold=0)
+    def __init__(self, session_name, api_id, api_hash, bot_token, base_url):
+        super().__init__(session_name, api_id, api_hash, connection_retries=2, timeout=15, flood_sleep_threshold=0)
         self.bot_token = bot_token
-        self.base_url = Server.BASE_URL.rstrip('/')
+        self.base_url = base_url.rstrip('/')
         self.in_use = False
 
     async def start_api(self):
-        await self.start(bot_token=self.bot_token)
-        logger.info("FileLinkAPI started")
+        try:
+            logger.info("Attempting to start Telegram client")
+            await self.start(bot_token=self.bot_token)
+            logger.info("FileLinkAPI started successfully")
+        except Exception as e:
+            logger.error("Failed to start FileLinkAPI: %s", e)
+            raise
 
 app = Quart(__name__)
 app.config["RESPONSE_TIMEOUT"] = None
@@ -132,7 +141,7 @@ async def transmit_file(file_id):
         logger.error("Invalid range request - Bytes: %s-%s/%s", from_bytes, until_bytes, file_size)
         await return_streaming_api(selected_api)
         abort(416, "Invalid range.")
-    chunk_size = 2 * 1024 * 1024  # 2 MB chunks for faster streaming
+    chunk_size = 2 * 1024 * 1024
     until_bytes = min(until_bytes, file_size - 1)
     offset = from_bytes - (from_bytes % chunk_size)
     first_part_cut = from_bytes - offset
@@ -149,7 +158,7 @@ async def transmit_file(file_id):
     logger.info("Starting file stream - API: %s, Chunks: %s, Chunk size: %s", api_name, part_count, chunk_size)
     async def file_generator():
         current_part = 1
-        prefetch_buffer = asyncio.Queue(maxsize=50)  # Larger buffer for large files
+        prefetch_buffer = asyncio.Queue(maxsize=50)
         async def prefetch_chunks():
             async for chunk in selected_api.iter_download(
                 file,
@@ -196,7 +205,7 @@ async def transmit_file(file_id):
 async def stream_file(file_id):
     code = request.args.get("code") or abort(401)
     quoted_code = urllib.parse.quote(code)
-    base_url = Server.BASE_URL.rstrip('/')
+    base_url = api_instance.base_url
     return await render_template_string(
         '<!DOCTYPE html><html lang="en"><head><title>Play Files</title><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="X-Frame-Options" content="deny"><link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" /><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css"><script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script><style>html, body { margin: 0; height: 100%; }#stream-media { height: 100%; width: 100%; }#error-message { color: red; font-size: 24px; text-align: center; margin-top: 20px; }.plyr__video-wrapper .plyr-download-button, .plyr__video-wrapper .plyr-share-button { position: absolute; top: 10px; left: 10px; width: 30px; height: 30px; background-color: rgba(0, 0, 0, 0.7); border-radius: 50%; text-align: center; line-height: 30px; color: white; z-index: 10; }.plyr__video-wrapper .plyr-share-button { top: 50px; }.plyr__video-wrapper .plyr-download-button:hover, .plyr__video-wrapper .plyr-share-button:hover { background-color: rgba(255, 255, 255, 0.7); color: black; }.plyr__video-wrapper .plyr-download-button:before { font-family: "Font Awesome 5 Free"; content: "\\f019"; font-weight: bold; }.plyr__video-wrapper .plyr-share-button:before { font-family: "Font Awesome 5 Free"; content: "\\f064"; font-weight: bold; }.plyr, .plyr__video-wrapper, .plyr__video-embed iframe { height: 100%; }</style></head><body><video id="stream-media" controls preload="auto"><source src="{{ mediaLink }}" type=""><p class="vjs-no-js">To view this video please enable JavaScript, and consider upgrading to a web browser that supports HTML5 video</p></video><div id="error-message"></div><script>var player = new Plyr("#stream-media", {controls: ["play-large", "rewind", "play", "fast-forward", "progress", "current-time", "mute", "settings", "pip", "fullscreen"],settings: ["speed", "loop"],speed: { selected: 1, options: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] },seek: 10,keyboard: { focused: true, global: true },});var mediaLink = "{{ mediaLink }}";if (mediaLink) {document.querySelector("#stream-media source").setAttribute("src", mediaLink);player.restart();var downloadButton = document.createElement("div");downloadButton.className = "plyr-download-button";downloadButton.onclick = function() {event.stopPropagation();var link = document.createElement("a");link.href = mediaLink;document.body.appendChild(link);link.click();document.body.removeChild(link);};player.elements.container.querySelector(".plyr__video-wrapper").appendChild(downloadButton);var shareButton = document.createElement("div");shareButton.className = "plyr-share-button";shareButton.onclick = function() {event.stopPropagation();if (navigator.share) {navigator.share({ title: "Play", url: mediaLink });}};player.elements.container.querySelector(".plyr__video-wrapper").appendChild(shareButton);} else {document.getElementById("error-message").textContent = "Error: Media URL not provided";}</script></body></html>',
         mediaLink=f"{base_url}/dl/{file_id}?code={quoted_code}"
@@ -221,20 +230,29 @@ app.register_error_handler(404, not_found)
 app.register_error_handler(405, invalid_method)
 app.register_error_handler(HTTPError, http_error)
 
+base_url = os.environ.get("HOST_URL", "https://fdlapi-ed9a85898ea5.herokuapp.com" if os.environ.get("DYNO") else "http://localhost:8000")
 api_instance = FileLinkAPI(
     session_name="file_link_api",
     api_id=Telegram.API_ID,
     api_hash=Telegram.API_HASH,
-    bot_token=Telegram.BOT_TOKEN
+    bot_token=Telegram.BOT_TOKEN,
+    base_url=base_url
 )
 
-async def main():
-    await api_instance.start_api()
-    logger.info("API running, starting web server...")
-    from uvicorn import Server as UvicornServer, Config
-    server = UvicornServer(Config(app=app, host=Server.BIND_ADDRESS, port=Server.PORT, log_config=None, timeout_keep_alive=120))
-    logger.info("Web server is started! Running on %s:%s", Server.BIND_ADDRESS, Server.PORT)
-    await server.serve()
+@app.before_serving
+async def startup():
+    logger.info("Running startup tasks")
+    try:
+        await api_instance.start_api()
+        logger.info("Startup completed successfully")
+    except Exception as e:
+        logger.error("Startup failed: %s", e)
+        raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    logger.info("Starting application on %s:%s", Server.BIND_ADDRESS, Server.PORT)
+    try:
+        uvicorn.run(app, host=Server.BIND_ADDRESS, port=Server.PORT, log_config=None, timeout_keep_alive=120)
+    except Exception as e:
+        logger.error("Failed to start uvicorn server: %s", e)
+        raise

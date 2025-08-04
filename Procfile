@@ -1,1 +1,1 @@
-start: python api.py
+python3 api.py

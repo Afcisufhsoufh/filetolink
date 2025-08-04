@@ -1,5 +1,6 @@
-fastapi==0.104.1
-telethon==1.35.0
-uvicorn[standard]==0.24.0
-cryptg==0.4.0
-python-multipart==0.0.6
+telethon
+cryptg
+asyncio
+quart
+python-dateutil
+uvicorn

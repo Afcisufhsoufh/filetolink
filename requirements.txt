@@ -1,6 +1,6 @@
-telethon
-cryptg
-asyncio
 quart
-python-dateutil
+telethon
 uvicorn
+hypercorn
+aiohttp
+pycares

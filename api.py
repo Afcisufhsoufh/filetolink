@@ -3,7 +3,9 @@ import logging
 import asyncio
 import os
 import urllib.parse
-from quart import Quart, Blueprint, Response, request, render_template_string
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse, HTMLResponse
 from telethon import TelegramClient
 from telethon.tl.custom import Message
 from datetime import datetime
@@ -15,10 +17,10 @@ import uvicorn
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s - %(levelname)s - %(message)s", 
-    handlers=[logging.StreamHandler(sys.stdout)]  # Changed to stdout for Heroku
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
-logger.info("Starting api.py, Python version: %s", sys.version)
+logger.info("Starting FastAPI app, Python version: %s", sys.version)
 
 class Telegram:
     API_ID = 28239710
@@ -29,24 +31,6 @@ class Telegram:
 class Server:
     BIND_ADDRESS = "0.0.0.0"
     PORT = int(os.environ.get("PORT", 8000))
-
-class HTTPError(Exception):
-    def __init__(self, status_code, description=None):
-        self.status_code = status_code
-        self.description = description
-        super().__init__(self.status_code, self.description)
-
-error_messages = {
-    400: "Invalid request.",
-    401: "File code is required to download the file.",
-    403: "Invalid file code.",
-    404: "File not found.",
-    416: "Invalid range.",
-    500: "Internal server error.",
-}
-
-def abort(status_code: int = 500, description: str = None):
-    raise HTTPError(status_code, description)
 
 def get_file_properties(message: Message):
     file_name = message.file.name
@@ -67,7 +51,7 @@ def get_file_properties(message: Message):
                 file_type, file_format = attribute, attributes[attribute]
                 break
         else:
-            abort(400, "Invalid media type.")
+            raise HTTPException(status_code=400, detail="Invalid media type.")
         date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         file_name = f"{file_type}-{date}.{file_format}"
     
@@ -82,9 +66,9 @@ class FileLinkAPI(TelegramClient):
             session_name, 
             api_id, 
             api_hash, 
-            connection_retries=3,  # Increased retries
-            timeout=30,  # Increased timeout
-            flood_sleep_threshold=60  # Add flood protection
+            connection_retries=3,
+            timeout=30,
+            flood_sleep_threshold=60
         )
         self.bot_token = bot_token
         self.base_url = base_url.rstrip('/')
@@ -101,20 +85,22 @@ class FileLinkAPI(TelegramClient):
             logger.error("Failed to start FileLinkAPI: %s", e)
             return False
 
-# Initialize app
-app = Quart(__name__)
-app.config["RESPONSE_TIMEOUT"] = None
-bp = Blueprint("main", __name__)
+# Initialize FastAPI app
+app = FastAPI(
+    title="File Link API",
+    description="Telegram File Streaming API",
+    version="1.0.0"
+)
 
 # Global API instance
-api_instance = None
+api_instance: Optional[FileLinkAPI] = None
 
 async def get_streaming_api():
     global api_instance
     if not api_instance:
-        raise HTTPError(503, "API not initialized.")
+        raise HTTPException(status_code=503, detail="API not initialized.")
     if api_instance.in_use:
-        raise HTTPError(503, "API instance busy. Try again later.")
+        raise HTTPException(status_code=503, detail="API instance busy. Try again later.")
     api_instance.in_use = True
     return api_instance
 
@@ -122,54 +108,56 @@ async def return_streaming_api(api):
     if api:
         api.in_use = False
 
-@bp.route("/")
+@app.get("/")
 async def home():
     return {
         "status": "active",
         "message": "File Link API is running",
-        "version": "1.0"
+        "version": "1.0",
+        "endpoints": {
+            "health": "/health",
+            "download": "/dl/{file_id}?code={code}",
+            "stream": "/stream/{file_id}?code={code}"
+        }
     }
 
-@bp.route("/health")
+@app.get("/health")
 async def health_check():
     global api_instance
     status = "healthy" if api_instance and api_instance.is_connected() else "unhealthy"
-    return {"status": status}
+    return {"status": status, "timestamp": datetime.now().isoformat()}
 
-@bp.route("/dl/<int:file_id>")
-async def transmit_file(file_id):
+@app.get("/dl/{file_id}")
+async def transmit_file(file_id: int, request: Request, code: Optional[str] = None):
+    if not code:
+        raise HTTPException(status_code=401, detail="File code is required to download the file.")
+    
     try:
         selected_api = await get_streaming_api()
         me = await selected_api.get_me()
         api_name = "@" + me.username
         logger.info("File download request - File ID: %s, Using API: %s", file_id, api_name)
         
-        file = None
         try:
             file = await selected_api.get_messages(Telegram.CHANNEL_ID, ids=int(file_id))
             if not file:
                 logger.warning("Message %s not found in channel %s", file_id, Telegram.CHANNEL_ID)
                 await return_streaming_api(selected_api)
-                abort(404)
+                raise HTTPException(status_code=404, detail="File not found.")
         except Exception as e:
             logger.error("Failed to retrieve message %s using API %s: %s", file_id, api_name, e)
             await return_streaming_api(selected_api)
-            abort(500)
-        
-        code = request.args.get("code")
-        if not code:
-            await return_streaming_api(selected_api)
-            abort(401)
+            raise HTTPException(status_code=500, detail="Internal server error.")
             
         if code != file.raw_text:
             logger.warning("Access denied - Invalid code for file %s", file_id)
             await return_streaming_api(selected_api)
-            abort(403)
+            raise HTTPException(status_code=403, detail="Invalid file code.")
         
         file_name, file_size, mime_type = get_file_properties(file)
         logger.info("File properties - Name: %s, Size: %s, Type: %s", file_name, file_size, mime_type)
         
-        range_header = request.headers.get("Range")
+        range_header = request.headers.get("range")
         if range_header:
             try:
                 from_bytes, until_bytes = range_header.replace("bytes=", "").split("-")
@@ -178,7 +166,7 @@ async def transmit_file(file_id):
                 logger.info("Range request - Bytes: %s-%s/%s", from_bytes, until_bytes, file_size)
             except ValueError:
                 await return_streaming_api(selected_api)
-                abort(400, "Invalid range header")
+                raise HTTPException(status_code=400, detail="Invalid range header")
         else:
             from_bytes = 0
             until_bytes = file_size - 1
@@ -187,7 +175,7 @@ async def transmit_file(file_id):
         if (until_bytes >= file_size) or (from_bytes < 0) or (until_bytes < from_bytes):
             logger.error("Invalid range request - Bytes: %s-%s/%s", from_bytes, until_bytes, file_size)
             await return_streaming_api(selected_api)
-            abort(416, "Invalid range.")
+            raise HTTPException(status_code=416, detail="Invalid range.")
         
         chunk_size = 2 * 1024 * 1024  # 2MB chunks
         until_bytes = min(until_bytes, file_size - 1)
@@ -243,31 +231,30 @@ async def transmit_file(file_id):
                 await return_streaming_api(selected_api)
                 logger.info("API %s returned to queue", api_name)
         
-        return Response(
+        return StreamingResponse(
             file_generator(), 
             headers=headers, 
-            status=206 if range_header else 200
+            status_code=206 if range_header else 200,
+            media_type=mime_type
         )
         
-    except HTTPError:
+    except HTTPException:
         raise
     except Exception as e:
         logger.error("Unexpected error in transmit_file: %s", e)
         if 'selected_api' in locals():
             await return_streaming_api(selected_api)
-        abort(500, "Internal server error")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-@bp.route("/stream/<int:file_id>")
-async def stream_file(file_id):
-    code = request.args.get("code")
+@app.get("/stream/{file_id}")
+async def stream_file(file_id: int, code: Optional[str] = None):
     if not code:
-        abort(401)
+        raise HTTPException(status_code=401, detail="File code is required.")
     
     quoted_code = urllib.parse.quote(code)
-    base_url = api_instance.base_url if api_instance else request.host_url.rstrip('/')
+    base_url = api_instance.base_url if api_instance else "http://localhost:8000"
     
-    return await render_template_string(
-        '''<!DOCTYPE html>
+    html_content = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
     <title>Play Files</title>
@@ -278,110 +265,81 @@ async def stream_file(file_id):
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
     <script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script>
     <style>
-        html, body { margin: 0; height: 100%; }
-        #stream-media { height: 100%; width: 100%; }
-        #error-message { color: red; font-size: 24px; text-align: center; margin-top: 20px; }
+        html, body {{ margin: 0; height: 100%; }}
+        #stream-media {{ height: 100%; width: 100%; }}
+        #error-message {{ color: red; font-size: 24px; text-align: center; margin-top: 20px; }}
         .plyr__video-wrapper .plyr-download-button, 
-        .plyr__video-wrapper .plyr-share-button { 
+        .plyr__video-wrapper .plyr-share-button {{ 
             position: absolute; top: 10px; left: 10px; width: 30px; height: 30px; 
             background-color: rgba(0, 0, 0, 0.7); border-radius: 50%; 
             text-align: center; line-height: 30px; color: white; z-index: 10; 
-        }
-        .plyr__video-wrapper .plyr-share-button { top: 50px; }
+        }}
+        .plyr__video-wrapper .plyr-share-button {{ top: 50px; }}
         .plyr__video-wrapper .plyr-download-button:hover, 
-        .plyr__video-wrapper .plyr-share-button:hover { 
+        .plyr__video-wrapper .plyr-share-button:hover {{ 
             background-color: rgba(255, 255, 255, 0.7); color: black; 
-        }
-        .plyr__video-wrapper .plyr-download-button:before { 
+        }}
+        .plyr__video-wrapper .plyr-download-button:before {{ 
             font-family: "Font Awesome 5 Free"; content: "\\f019"; font-weight: bold; 
-        }
-        .plyr__video-wrapper .plyr-share-button:before { 
+        }}
+        .plyr__video-wrapper .plyr-share-button:before {{ 
             font-family: "Font Awesome 5 Free"; content: "\\f064"; font-weight: bold; 
-        }
-        .plyr, .plyr__video-wrapper, .plyr__video-embed iframe { height: 100%; }
+        }}
+        .plyr, .plyr__video-wrapper, .plyr__video-embed iframe {{ height: 100%; }}
     </style>
 </head>
 <body>
     <video id="stream-media" controls preload="auto">
-        <source src="{{ mediaLink }}" type="">
+        <source src="{base_url}/dl/{file_id}?code={quoted_code}" type="">
         <p class="vjs-no-js">To view this video please enable JavaScript, and consider upgrading to a web browser that supports HTML5 video</p>
     </video>
     <div id="error-message"></div>
     <script>
-        var player = new Plyr("#stream-media", {
+        var player = new Plyr("#stream-media", {{
             controls: ["play-large", "rewind", "play", "fast-forward", "progress", "current-time", "mute", "settings", "pip", "fullscreen"],
             settings: ["speed", "loop"],
-            speed: { selected: 1, options: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] },
+            speed: {{ selected: 1, options: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] }},
             seek: 10,
-            keyboard: { focused: true, global: true },
-        });
+            keyboard: {{ focused: true, global: true }},
+        }});
         
-        var mediaLink = "{{ mediaLink }}";
-        if (mediaLink) {
+        var mediaLink = "{base_url}/dl/{file_id}?code={quoted_code}";
+        if (mediaLink) {{
             document.querySelector("#stream-media source").setAttribute("src", mediaLink);
             player.restart();
             
             var downloadButton = document.createElement("div");
             downloadButton.className = "plyr-download-button";
-            downloadButton.onclick = function() {
+            downloadButton.onclick = function() {{
                 event.stopPropagation();
                 var link = document.createElement("a");
                 link.href = mediaLink;
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
-            };
+            }};
             player.elements.container.querySelector(".plyr__video-wrapper").appendChild(downloadButton);
             
             var shareButton = document.createElement("div");
             shareButton.className = "plyr-share-button";
-            shareButton.onclick = function() {
+            shareButton.onclick = function() {{
                 event.stopPropagation();
-                if (navigator.share) {
-                    navigator.share({ title: "Play", url: mediaLink });
-                }
-            };
+                if (navigator.share) {{
+                    navigator.share({{ title: "Play", url: mediaLink }});
+                }}
+            }};
             player.elements.container.querySelector(".plyr__video-wrapper").appendChild(shareButton);
-        } else {
+        }} else {{
             document.getElementById("error-message").textContent = "Error: Media URL not provided";
-        }
+        }}
     </script>
 </body>
-</html>''',
-        mediaLink=f"{base_url}/dl/{file_id}?code={quoted_code}"
-    )
+</html>'''
+    
+    return HTMLResponse(content=html_content)
 
-# Error handlers
-async def invalid_request(error):
-    return {"error": "Invalid request", "status": 400}, 400
-
-async def not_found(error):
-    return {"error": "Resource not found", "status": 404}, 404
-
-async def invalid_method(error):
-    return {"error": "Invalid request method", "status": 405}, 405
-
-async def http_error(error: HTTPError):
-    error_message = error_messages.get(error.status_code, "Unknown error")
-    return {
-        "error": error.description or error_message,
-        "status": error.status_code
-    }, error.status_code
-
-async def internal_error(error):
-    logger.error("Internal server error: %s", error)
-    return {"error": "Internal server error", "status": 500}, 500
-
-# Register blueprints and error handlers
-app.register_blueprint(bp)
-app.register_error_handler(400, invalid_request)
-app.register_error_handler(404, not_found)
-app.register_error_handler(405, invalid_method)
-app.register_error_handler(500, internal_error)
-app.register_error_handler(HTTPError, http_error)
-
-@app.before_serving
-async def startup():
+@app.on_event("startup")
+async def startup_event():
     global api_instance
     logger.info("Running startup tasks")
     
@@ -421,11 +379,10 @@ async def startup():
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff
             else:
                 logger.error("All startup attempts failed")
-                # Don't raise here - let the app start anyway
                 return
 
-@app.after_serving
-async def shutdown():
+@app.on_event("shutdown")
+async def shutdown_event():
     global api_instance
     logger.info("Shutting down...")
     if api_instance:
@@ -436,20 +393,18 @@ async def shutdown():
             logger.error("Error during shutdown: %s", e)
 
 if __name__ == "__main__":
-    logger.info("Starting application on %s:%s", Server.BIND_ADDRESS, Server.PORT)
+    logger.info("Starting FastAPI application on %s:%s", Server.BIND_ADDRESS, Server.PORT)
     try:
-        # Use hypercorn for better async support on Heroku
-        config = uvicorn.Config(
-            app=app,
+        uvicorn.run(
+            "api:app",
             host=Server.BIND_ADDRESS,
             port=Server.PORT,
             log_config=None,
             timeout_keep_alive=120,
             timeout_graceful_shutdown=30,
-            access_log=True
+            access_log=True,
+            reload=False
         )
-        server = uvicorn.Server(config)
-        asyncio.run(server.serve())
     except Exception as e:
         logger.error("Failed to start server: %s", e)
         sys.exit(1)

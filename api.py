@@ -68,7 +68,7 @@ def get_file_properties(message: Message):
 
 class FileLinkAPI(TelegramClient):
     def __init__(self, session_name, api_id, api_hash, bot_token, base_url):
-        super().__init__(session_name, api_id, api_hash, connection_retries=-1, timeout=120, flood_sleep_threshold=0)
+        super().__init__(session_name, api_id, api_hash, connection_retries=3, timeout=30, flood_sleep_threshold=0)
         self.bot_token = bot_token
         self.base_url = base_url.rstrip('/')
         self.in_use = False
@@ -244,7 +244,11 @@ async def start_application():
         raise
 
 if __name__ == "__main__":
-    logger.info("Starting application...")
-    asyncio.run(start_application())
-    logger.info("Starting uvicorn server on %s:%s", Server.BIND_ADDRESS, Server.PORT)
-    uvicorn.run(app, host=Server.BIND_ADDRESS, port=Server.PORT, log_config=None, timeout_keep_alive=120)
+    logger.info("Starting application on %s:%s", Server.BIND_ADDRESS, Server.PORT)
+    try:
+        asyncio.run(start_application())
+        logger.info("Starting uvicorn server")
+        uvicorn.run(app, host=Server.BIND_ADDRESS, port=Server.PORT, log_config=None, timeout_keep_alive=120)
+    except Exception as e:
+        logger.error("Failed to start server: %s", e)
+        raise

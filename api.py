@@ -7,6 +7,7 @@ from math import ceil, floor
 import logging
 import asyncio
 import urllib.parse
+import os  # Added for environment variable access
 
 class Telegram:
     API_ID = 28239710
@@ -17,7 +18,7 @@ class Telegram:
 class Server:
     BASE_URL = "https://filetolink-production-f396.up.railway.app"
     BIND_ADDRESS = "0.0.0.0"
-    PORT = 8000
+    PORT = int(os.getenv("PORT", 8000))  # Use Heroku's $PORT or fallback to 8000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

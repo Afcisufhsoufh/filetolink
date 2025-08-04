@@ -1,6 +1,6 @@
-telethon
-cryptg
-asyncio
-quart
-python-dateutil
-uvicorn
+quart==0.19.0
+telethon==1.36.0
+uvicorn==0.30.6
+hypercorn==0.17.3
+aiohttp==3.10.5
+pycares==4.4.0

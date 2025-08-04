@@ -8,6 +8,7 @@ import logging
 import asyncio
 import urllib.parse
 import os
+import uvicorn
 
 class Telegram:
     API_ID = 28239710
@@ -73,8 +74,12 @@ class FileLinkAPI(TelegramClient):
         self.in_use = False
 
     async def start_api(self):
-        await self.start(bot_token=self.bot_token)
-        logger.info("FileLinkAPI started")
+        try:
+            await self.start(bot_token=self.bot_token)
+            logger.info("FileLinkAPI started successfully")
+        except Exception as e:
+            logger.error("Failed to start FileLinkAPI: %s", e)
+            raise
 
 app = Quart(__name__)
 app.config["RESPONSE_TIMEOUT"] = None
@@ -221,7 +226,7 @@ app.register_error_handler(404, not_found)
 app.register_error_handler(405, invalid_method)
 app.register_error_handler(HTTPError, http_error)
 
-base_url = os.environ.get("HOST_URL", "https://fdlapi-ed9a85898ea5.herokuapp.com")
+base_url = os.environ.get("HOST_URL", "https://fdlapi-ed9a85898ea5.herokuapp.com" if os.environ.get("DYNO") else "http://localhost:8000")
 api_instance = FileLinkAPI(
     session_name="file_link_api",
     api_id=Telegram.API_ID,
@@ -230,7 +235,16 @@ api_instance = FileLinkAPI(
     base_url=base_url
 )
 
+async def start_application():
+    try:
+        await api_instance.start_api()
+        logger.info("Application startup completed")
+    except Exception as e:
+        logger.error("Application startup failed: %s", e)
+        raise
+
 if __name__ == "__main__":
-    import uvicorn
-    asyncio.run(api_instance.start_api())
+    logger.info("Starting application...")
+    asyncio.run(start_application())
+    logger.info("Starting uvicorn server on %s:%s", Server.BIND_ADDRESS, Server.PORT)
     uvicorn.run(app, host=Server.BIND_ADDRESS, port=Server.PORT, log_config=None, timeout_keep_alive=120)

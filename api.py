@@ -221,7 +221,7 @@ app.register_error_handler(404, not_found)
 app.register_error_handler(405, invalid_method)
 app.register_error_handler(HTTPError, http_error)
 
-base_url = os.environ.get("HOST_URL", "https://fdlapi.herokuapp.com")
+base_url = os.environ.get("HOST_URL", "https://fdlapi-ed9a85898ea5.herokuapp.com")
 api_instance = FileLinkAPI(
     session_name="file_link_api",
     api_id=Telegram.API_ID,
@@ -230,13 +230,7 @@ api_instance = FileLinkAPI(
     base_url=base_url
 )
 
-async def main():
-    await api_instance.start_api()
-    logger.info("API running, starting web server...")
-    from uvicorn import Server as UvicornServer, Config
-    server = UvicornServer(Config(app=app, host=Server.BIND_ADDRESS, port=Server.PORT, log_config=None, timeout_keep_alive=120))
-    logger.info("Web server is started! Running on %s:%s", Server.BIND_ADDRESS, Server.PORT)
-    await server.serve()
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    import uvicorn
+    asyncio.run(api_instance.start_api())
+    uvicorn.run(app, host=Server.BIND_ADDRESS, port=Server.PORT, log_config=None, timeout_keep_alive=120)
